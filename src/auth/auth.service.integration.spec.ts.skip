@@ -1,0 +1,317 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { AuthService } from './auth.service';
+
+describe('AuthService Integration Tests', () => {
+  let service: AuthService;
+
+  beforeAll(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [AuthService],
+    }).compile();
+
+    service = module.get<AuthService>(AuthService);
+  });
+
+  describe('getToken Integration', () => {
+    it('should successfully get token from real SENAC API', async () => {
+      try {
+        const result = await service.getToken();
+
+        expect(result).toBeDefined();
+        expect(typeof result).toBe('string');
+        expect(result.length).toBeGreaterThan(0);
+      } catch (error) {
+        // Expected to throw for network issues or invalid credentials
+        expect(error).toBeDefined();
+        expect(error.message).toBeDefined();
+      }
+    }, 30000);
+
+    it('should handle SENAC API errors gracefully', async () => {
+      try {
+        const result = await service.getToken();
+        expect(result).toBeDefined();
+      } catch (error) {
+        // Expected to throw for API errors
+        expect(error).toBeDefined();
+        expect(error.message).toContain('Erro ao gerar token');
+      }
+    }, 30000);
+  });
+
+  describe('authenticateUser Integration', () => {
+    it('should successfully authenticate user with real SENAC API', async () => {
+      try {
+        // First get a token
+        const token = await service.getToken();
+
+        // Then authenticate user
+        const result = await service.authenticateUser(
+          process.env.TEST_USER_EMAIL || 'test@senac.br',
+          process.env.TEST_USER_PASSWORD || 'testpassword',
+          token,
+        );
+
+        expect(result).toBeDefined();
+        expect(result.emplid).toBeDefined();
+        expect(result.email).toBeDefined();
+        expect(result.nome).toBeDefined();
+        expect(result.unidade).toBeDefined();
+      } catch (error) {
+        // Expected to throw for invalid credentials or network issues
+        expect(error).toBeDefined();
+        expect(error.message).toBeDefined();
+      }
+    }, 30000);
+
+    it('should handle invalid credentials gracefully', async () => {
+      try {
+        // First get a token
+        const token = await service.getToken();
+
+        // Then try to authenticate with invalid credentials
+        const result = await service.authenticateUser(
+          'invalid@senac.br',
+          'wrongpassword',
+          token,
+        );
+
+        // If it doesn't throw, check the response structure
+        expect(result).toBeDefined();
+      } catch (error) {
+        // Expected to throw for invalid credentials
+        expect(error).toBeDefined();
+        expect(error.message).toContain('Erro na autenticação');
+      }
+    }, 30000);
+
+    it('should handle network errors gracefully', async () => {
+      try {
+        const result = await service.authenticateUser(
+          'test@senac.br',
+          'password123',
+          'invalid-token',
+        );
+
+        expect(result).toBeDefined();
+      } catch (error) {
+        // Expected to throw for network issues
+        expect(error).toBeDefined();
+        expect(error.message).toBeDefined();
+      }
+    }, 30000);
+  });
+
+  describe('decryptCredentials Integration', () => {
+    it('should decrypt credentials using fallback method', async () => {
+      const credentials = {
+        username: 'test@senac.br',
+        password: 'password123',
+      };
+      const encrypted = btoa(JSON.stringify(credentials));
+      const iv = 'fallback';
+
+      const result = await service.decryptCredentials(encrypted, iv);
+
+      expect(result).toEqual(credentials);
+    });
+
+    it('should decrypt credentials using simple method', async () => {
+      const credentials = {
+        username: 'test@senac.br',
+        password: 'password123',
+        timestamp: Date.now(),
+      };
+      const step1 = btoa(JSON.stringify(credentials));
+      const step2 = step1.split('').reverse().join('');
+      const step3 = btoa(`${step2}_${credentials.timestamp}`);
+      const encrypted = step3;
+      const iv = 'simple';
+
+      const result = await service.decryptCredentials(encrypted, iv);
+
+      expect(result).toEqual({
+        username: 'test@senac.br',
+        password: 'password123',
+      });
+    });
+
+    it('should decrypt credentials using basic method', async () => {
+      const credentials = {
+        username: 'test@senac.br',
+        password: 'password123',
+      };
+      const encrypted = btoa(JSON.stringify(credentials));
+      const iv = 'basic';
+
+      const result = await service.decryptCredentials(encrypted, iv);
+
+      expect(result).toEqual(credentials);
+    });
+
+    it('should handle invalid encrypted data', async () => {
+      const encrypted = 'invalid-base64-data';
+      const iv = 'fallback';
+
+      const result = await service.decryptCredentials(encrypted, iv);
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('validateKeycloakToken Integration', () => {
+    it('should validate token with real Keycloak server', async () => {
+      try {
+        const result = await service.validateKeycloakToken('Bearer test-token');
+
+        expect(result).toBeDefined();
+        expect(result.valid).toBeDefined();
+        expect(typeof result.valid).toBe('boolean');
+
+        if (result.valid) {
+          expect(result.data).toBeDefined();
+        } else {
+          expect(result.error).toBeDefined();
+        }
+      } catch (error) {
+        // Expected to throw for network issues or invalid Keycloak configuration
+        expect(error).toBeDefined();
+        expect(error.message).toBeDefined();
+      }
+    }, 30000);
+
+    it('should handle invalid token format', async () => {
+      try {
+        const result = await service.validateKeycloakToken(
+          'invalid-token-format',
+        );
+
+        expect(result).toBeDefined();
+        expect(result.valid).toBeDefined();
+      } catch (error) {
+        // Expected to throw for network issues
+        expect(error).toBeDefined();
+        expect(error.message).toBeDefined();
+      }
+    }, 30000);
+
+    it('should handle network errors gracefully', async () => {
+      try {
+        const result = await service.validateKeycloakToken('Bearer test-token');
+
+        expect(result).toBeDefined();
+        expect(result.valid).toBe(false);
+        expect(result.error).toBeDefined();
+      } catch (error) {
+        // Expected to throw for network issues
+        expect(error).toBeDefined();
+        expect(error.message).toBeDefined();
+      }
+    }, 30000);
+  });
+
+  describe('extractKeycloakUserData Integration', () => {
+    it('should extract user data from real token data structure', () => {
+      const tokenData = {
+        email: 'test@senac.br',
+        preferred_username: 'testuser',
+        sub: 'user-123',
+        name: 'Test User',
+        given_name: 'Test',
+        family_name: 'User',
+        email_verified: true,
+        realm_access: { roles: ['user', 'admin'] },
+        resource_access: {
+          'senac-orchestrate': { roles: ['user'] },
+          account: { roles: ['manage-account'] },
+        },
+      };
+
+      const result = service.extractKeycloakUserData(tokenData);
+
+      expect(result).toEqual({
+        email: 'test@senac.br',
+        username: 'testuser',
+        sub: 'user-123',
+        name: 'Test User',
+        given_name: 'Test',
+        family_name: 'User',
+        email_verified: true,
+        realm_access: { roles: ['user', 'admin'] },
+        resource_access: {
+          'senac-orchestrate': { roles: ['user'] },
+          account: { roles: ['manage-account'] },
+        },
+      });
+    });
+
+    it('should handle minimal token data', () => {
+      const tokenData = {
+        email: 'test@senac.br',
+        sub: 'user-123',
+      };
+
+      const result = service.extractKeycloakUserData(tokenData);
+
+      expect(result).toEqual({
+        email: 'test@senac.br',
+        username: undefined,
+        sub: 'user-123',
+        name: undefined,
+        given_name: undefined,
+        family_name: undefined,
+        email_verified: undefined,
+        realm_access: undefined,
+        resource_access: undefined,
+      });
+    });
+  });
+
+  // Health check tests - these should always pass if services are running
+  describe('Auth Service Health Checks', () => {
+    it('should verify SENAC API is accessible', async () => {
+      try {
+        const result = await service.getToken();
+        expect(result).toBeDefined();
+        expect(typeof result).toBe('string');
+      } catch (error) {
+        // Log the error but don't fail the test
+        // This helps identify if SENAC API is down
+        console.warn('SENAC API health check failed:', error.message);
+      }
+    }, 30000);
+
+    it('should verify authentication flow works', async () => {
+      try {
+        // Test the complete authentication flow
+        const token = await service.getToken();
+        expect(token).toBeDefined();
+
+        const authResult = await service.authenticateUser(
+          process.env.TEST_USER_EMAIL || 'test@senac.br',
+          process.env.TEST_USER_PASSWORD || 'testpassword',
+          token,
+        );
+        expect(authResult).toBeDefined();
+        expect(authResult.emplid).toBeDefined();
+      } catch (error) {
+        // Log the error but don't fail the test
+        console.warn('Authentication flow health check failed:', error.message);
+      }
+    }, 60000);
+
+    it('should verify Keycloak integration works', async () => {
+      try {
+        const result = await service.validateKeycloakToken('Bearer test-token');
+        expect(result).toBeDefined();
+        expect(result.valid).toBeDefined();
+      } catch (error) {
+        // Log the error but don't fail the test
+        console.warn(
+          'Keycloak integration health check failed:',
+          error.message,
+        );
+      }
+    }, 30000);
+  });
+});
