@@ -18,14 +18,13 @@ export class CoreService {
     );
 
     // Integração básica: enviar mensagem e retornar resposta
-    // Assumindo que agent_id vem no contexto se assistant for null
-    const agentId =
-      payload.context?.assistant_id ||
-      payload.context?.agent_id ||
-      process.env.ORCHESTRATE_AGENT_ID;
+    // agent_id DEVE vir do widget (como assistantId) e ser passado no context
+    const agentId = payload.context?.agent_id;
 
     if (!agentId) {
-      throw new Error('Agent ID not provided');
+      throw new Error(
+        'Agent ID not provided. Widget must send assistantId (UUID do agent no Watson Orchestrate)',
+      );
     }
 
     // Na primeira mensagem não enviamos thread_id
@@ -48,13 +47,6 @@ export class CoreService {
         payload.context,
       );
 
-      this.logger.debug('Watson Orchestrate response received', {
-        hasOutput: !!wxResponse?.output,
-        hasThreadId: !!wxResponse?.thread_id,
-        hasThread: !!wxResponse?.thread,
-        responseKeys: wxResponse ? Object.keys(wxResponse) : [],
-      });
-
       // Capturar thread_id da resposta (retornado na primeira mensagem)
       const responseThreadId = wxResponse.thread_id || wxResponse.thread?.id;
       const context = {
@@ -63,11 +55,6 @@ export class CoreService {
         // Manter o conversationId do widget como referência
         session_id: payload.conversationId,
       };
-
-      this.logger.debug('Final context prepared', {
-        hasThreadId: !!context.thread_id,
-        sessionId: context.session_id,
-      });
 
       return {
         response: wxResponse,

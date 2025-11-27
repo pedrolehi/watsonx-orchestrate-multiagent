@@ -35,20 +35,9 @@ export class BrokerWidgetService {
     data: WidgetConversationDto,
     files?: Array<Express.Multer.File>,
   ): Promise<WidgetConversationResponseDto> {
-    // Log consolidado de entrada do widget
-    this.logger.log('User conversation', {
+    this.logger.log('User message', {
       sessionId: data.sessionId,
-      assistantId: data.assistantId,
-      text: data.text,
-      hasFiles: !!files && files.length > 0,
-      fileCount: files ? files.length : 0,
-      fileInfo: files
-        ? files.map((file) => ({
-            originalname: file.originalname,
-            size: file.size,
-            mimetype: file.mimetype,
-          }))
-        : null,
+      text: data.text?.substring(0, 50) + (data.text?.length > 50 ? '...' : ''),
     });
 
     // Nota: A validação do assistente e persistência de conversa foram movidas/removidas
@@ -61,6 +50,12 @@ export class BrokerWidgetService {
       data.user?.thread_id || data.user?.context?.thread_id;
     const isFirstMessage = !previousThreadId;
 
+    // Extrair apenas os valores essenciais para o contexto do agent
+    const emplid = data.user?.emplid || data.user?.context?.emplid;
+    const chapa = data.user?.chapa || data.user?.context?.chapa;
+    // assistantId é o UUID do agent no Watson Orchestrate
+    const agentId = data.assistantId;
+
     const payload: CoreRunDto = {
       message: {
         type: 'text',
@@ -69,18 +64,17 @@ export class BrokerWidgetService {
       conversationId: data.sessionId,
       profileName: 'Widget User',
       context: {
-        ...data.user,
+        // agent_id é o UUID do agent no Watson Orchestrate (enviado pelo widget como assistantId)
+        ...(agentId && { agent_id: agentId }),
+        // Dados de identificação do usuário (apenas um será preenchido)
+        ...(emplid && { emplid }),
+        ...(chapa && { chapa }),
+        // Thread ID para continuar a conversa (enviado via header X-IBM-THREAD-ID também)
         ...(previousThreadId && { thread_id: previousThreadId }),
-        ...(isFirstMessage && { is_first_message: true }),
-        // Garantir que resultAluno e emplid estejam no contexto para o welcome_tool
-        resultAluno: data.user?.resultAluno || data.user?.context?.resultAluno,
-        emplid:
-          data.user?.emplid || data.user?.context?.emplid || data.user?.chapa,
-        filesReceived: hasFiles,
-        attachmentNames: hasFiles
-          ? files.map((file) => file.originalname)
-          : undefined,
-        assistant_id: data.assistantId,
+        // IMPORTANTE: is_first_message deve ser true APENAS na primeira chamada
+        is_first_message: isFirstMessage,
+        // Session ID para referência
+        session_id: data.sessionId,
       },
       channel: 'widget',
     };
@@ -141,13 +135,7 @@ export class BrokerWidgetService {
       };
     }
 
-    this.logger.log('Response prepared', {
-      sessionId: data.sessionId,
-      totalMessages: response.messages.length,
-      hasSettings: !!response.settings,
-      hasFiles: !!files && files.length > 0,
-      hasDebug: !!response.debug,
-    });
+    this.logger.log('Response', { messages: response.messages.length });
 
     return response;
   }

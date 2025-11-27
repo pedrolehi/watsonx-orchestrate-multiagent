@@ -47,89 +47,28 @@ export class WatsonxService {
       baseURL,
     });
 
-    // Interceptor de REQUEST para logar requisições
+    // Interceptor de REQUEST para adicionar autenticação
     this.axiosInstance.interceptors.request.use(
       async (config) => {
         const token = await this.getIamToken();
         config.headers.Authorization = `Bearer ${token}`;
         config.headers['IAM-API_KEY'] = this.apiKey;
-
-        // Log detalhado da requisição
-        this.logger.log('[AXIOS REQUEST]', {
-          method: config.method?.toUpperCase(),
-          url: config.url,
-          baseURL: config.baseURL,
-          headers: {
-            Authorization: config.headers.Authorization
-              ? 'Bearer ***'
-              : undefined,
-            'IAM-API_KEY': config.headers['IAM-API_KEY'] ? '***' : undefined,
-            Accept: config.headers.Accept,
-            'Content-Type': config.headers['Content-Type'],
-          },
-          params: config.params,
-          data: config.data
-            ? JSON.stringify(config.data).substring(0, 500)
-            : undefined,
-        });
-
         return config;
       },
       (error) => {
-        this.logger.error('[AXIOS REQUEST ERROR]', error);
+        this.logger.error('Request error', { message: error.message });
         return Promise.reject(error);
       },
     );
 
-    // Interceptor de RESPONSE para logar respostas
+    // Interceptor de RESPONSE apenas para erros
     this.axiosInstance.interceptors.response.use(
-      (response) => {
-        // Log detalhado da resposta
-        this.logger.log('[AXIOS RESPONSE]', {
-          status: response.status,
-          statusText: response.statusText,
-          url: response.config.url,
-          method: response.config.method?.toUpperCase(),
-          headers: response.headers,
-          dataType: typeof response.data,
-          dataLength: Array.isArray(response.data)
-            ? response.data.length
-            : response.data
-              ? JSON.stringify(response.data).length
-              : 0,
-          dataPreview: Array.isArray(response.data)
-            ? `Array[${response.data.length}] - First item: ${JSON.stringify(response.data[0] || {}).substring(0, 200)}`
-            : response.data
-              ? JSON.stringify(response.data).substring(0, 500)
-              : 'No data',
-        });
-
-        // Log completo do data se for array pequeno ou objeto
-        if (Array.isArray(response.data) && response.data.length <= 5) {
-          this.logger.debug('[AXIOS RESPONSE DATA]', {
-            fullData: response.data,
-          });
-        } else if (
-          !Array.isArray(response.data) &&
-          typeof response.data === 'object'
-        ) {
-          this.logger.debug('[AXIOS RESPONSE DATA]', {
-            fullData: response.data,
-          });
-        }
-
-        return response;
-      },
+      (response) => response,
       (error) => {
-        // Log detalhado de erros
-        this.logger.error('[AXIOS RESPONSE ERROR]', {
-          message: error.message,
+        this.logger.error('Response error', {
           status: error.response?.status,
-          statusText: error.response?.statusText,
+          message: error.message,
           url: error.config?.url,
-          method: error.config?.method?.toUpperCase(),
-          responseData: error.response?.data,
-          responseHeaders: error.response?.headers,
         });
         return Promise.reject(error);
       },
@@ -193,6 +132,7 @@ export class WatsonxService {
           content: message,
         },
         agent_id: agentId,
+        // thread_id no body para continuar a conversa (endpoint /runs)
         ...(threadId && { thread_id: threadId }),
         ...(context && { context }),
       };
@@ -233,26 +173,27 @@ export class WatsonxService {
         `Sending streaming message to agent ${agentId}${threadId ? `, thread ${threadId}` : ' (new thread)'}`,
       );
 
+      // Primeira mensagem: message, agent_id e context (para chapa/emplid)
+      // Mensagens seguintes: adiciona thread_id
       const payload: any = {
         message: {
           role: 'user',
           content: message,
         },
         agent_id: agentId,
-        ...(threadId && { thread_id: threadId }),
+        // context é enviado sempre (contém chapa/emplid para identificação)
         ...(context && { context }),
       };
 
-      // Log detalhado do contexto para debug
-      this.logger.log('[sendMessageStream] Payload context', {
-        hasContext: !!context,
-        contextKeys: context ? Object.keys(context) : [],
-        isFirstMessage: context?.is_first_message,
-        hasEmplid: !!context?.emplid,
-        hasResultAluno: !!context?.resultAluno,
-        contextPreview: context
-          ? JSON.stringify(context).substring(0, 500)
-          : 'null',
+      // thread_id só é enviado a partir da segunda mensagem
+      if (threadId) {
+        payload.thread_id = threadId;
+      }
+
+      this.logger.debug('[sendMessageStream]', {
+        agentId,
+        threadId: threadId || 'new (first message)',
+        payload: JSON.stringify(payload),
       });
 
       const response = await this.axiosInstance.post('/runs', payload, {
@@ -273,9 +214,31 @@ export class WatsonxService {
       // Processar o stream SSE
       return await this.processSSEStream(response.data);
     } catch (error: any) {
+      // Quando responseType é 'stream', error.response.data é um stream, precisamos lê-lo
+      let errorBody = error.message;
+      if (
+        error.response?.data &&
+        typeof error.response.data.on === 'function'
+      ) {
+        try {
+          const chunks: Buffer[] = [];
+          for await (const chunk of error.response.data) {
+            chunks.push(chunk);
+          }
+          errorBody = Buffer.concat(chunks).toString('utf-8');
+        } catch {
+          errorBody = 'Could not read error body from stream';
+        }
+      } else if (error.response?.data) {
+        errorBody = JSON.stringify(error.response.data);
+      }
+
       this.logger.error(
         'Error sending streaming message to Watson Orchestrate',
-        error.response?.data || error.message,
+        {
+          status: error.response?.status,
+          errorBody,
+        },
       );
       throw error;
     }
@@ -507,15 +470,6 @@ export class WatsonxService {
                 // Capturar step_history se disponível
                 if (msg.step_history && Array.isArray(msg.step_history)) {
                   debugInfo.stepHistory = msg.step_history;
-                  this.logger.log('Step history found in message', {
-                    messageId: msg.id,
-                    stepsCount: msg.step_history.length,
-                    steps: msg.step_history.map((step: any) => ({
-                      step_id: step.step_id,
-                      step_type: step.step_type,
-                      hasDetails: !!step.step_details,
-                    })),
-                  });
                 }
 
                 // Detectar user activity
@@ -547,19 +501,10 @@ export class WatsonxService {
               // Adicionar user activities ao debug se houver
               if (userActivities.length > 0) {
                 debugInfo.userActivities = userActivities;
-                this.logger.log('User activities detected in polling', {
-                  count: userActivities.length,
-                  activities: userActivities,
-                });
               }
 
               if (allContent.length > 0) {
                 response.output.generic = allContent;
-                this.logger.log('Polling completed, accumulated messages', {
-                  totalAssistantMessages: assistantMessages.length,
-                  finalMessages: finalMessages.length,
-                  totalContentItems: allContent.length,
-                });
               } else {
                 // Fallback: usar todas as mensagens do assistente se não encontrou finais
                 assistantMessages.forEach((msg: any) => {
@@ -568,10 +513,6 @@ export class WatsonxService {
                   }
                 });
                 response.output.generic = allContent;
-                this.logger.log('Using all assistant messages as fallback', {
-                  totalMessages: assistantMessages.length,
-                  totalContentItems: allContent.length,
-                });
               }
             } catch (pollError: any) {
               this.logger.error('Error during polling', pollError.message);
@@ -629,24 +570,13 @@ export class WatsonxService {
               // Adicionar user activities ao debug se houver
               if (userActivities.length > 0) {
                 debugInfo.userActivities = userActivities;
-                this.logger.log('User activities detected in normal message', {
-                  count: userActivities.length,
-                  activities: userActivities,
-                });
               }
 
               if (allContent.length > 0) {
                 response.output.generic = allContent;
-                this.logger.log('Using all thread messages', {
-                  totalAssistantMessages: assistantMessages.length,
-                  totalContentItems: allContent.length,
-                });
               } else if (messageCreated?.content) {
                 // Fallback para conteúdo inicial
                 response.output.generic = messageCreated.content;
-                this.logger.log('Using message.created content (fallback)', {
-                  contentItems: messageCreated.content.length,
-                });
               }
             } catch (pollError: any) {
               this.logger.warn(
@@ -668,9 +598,6 @@ export class WatsonxService {
             // Sem thread_id, usar conteúdo inicial
             if (messageCreated?.content) {
               response.output.generic = messageCreated.content;
-              this.logger.log('Using message.created content (no thread)', {
-                contentItems: messageCreated.content.length,
-              });
             }
           }
         }
@@ -1428,31 +1355,6 @@ export class WatsonxService {
         },
       );
 
-      // Log detalhado do que foi retornado
-      this.logger.log('[getThreadMessages] Response received', {
-        isArray: Array.isArray(response.data),
-        messageCount: Array.isArray(response.data) ? response.data.length : 0,
-        firstMessage:
-          Array.isArray(response.data) && response.data.length > 0
-            ? {
-                id: response.data[0].id,
-                role: response.data[0].role,
-                hasContent: !!response.data[0].content,
-                contentLength: response.data[0].content?.length || 0,
-                contentPreview: response.data[0].content
-                  ? JSON.stringify(response.data[0].content).substring(0, 300)
-                  : null,
-              }
-            : null,
-      });
-
-      // Log completo se tiver poucas mensagens
-      if (Array.isArray(response.data) && response.data.length <= 3) {
-        this.logger.debug('[getThreadMessages] Full response data', {
-          messages: response.data,
-        });
-      }
-
       return response.data;
     } catch (error: any) {
       this.logger.error(
@@ -1686,34 +1588,10 @@ export class WatsonxService {
                   details: details,
                 };
               });
-
-              this.logger.log('Step history found in polling message', {
-                messageId: msg.id,
-                stepsCount: msg.step_history.length,
-                steps: stepDetails,
-              });
-            }
-
-            // Detectar se a mensagem requer user activity
-            const requiresUserActivity = this.detectUserActivity(msg);
-            if (requiresUserActivity) {
-              this.logger.log('User activity required detected', {
-                messageId: msg.id,
-                activityType: requiresUserActivity.type,
-                details: requiresUserActivity.details,
-              });
             }
           });
 
-          this.logger.log('New messages detected', {
-            attempt: attempts + 1,
-            newMessagesCount: newMessages.length,
-            totalMessages: currentMessageCount,
-            newMessageIds: newMessages.map((m: any) => m.id),
-            hasUserActivity: newMessages.some((msg: any) =>
-              this.detectUserActivity(msg),
-            ),
-          });
+          this.logger.debug('New messages', { count: newMessages.length });
 
           noNewMessagesCount = 0; // Reset contador
         } else {
@@ -1745,16 +1623,6 @@ export class WatsonxService {
             : null;
 
           if (!isStillProcessing) {
-            this.logger.log(
-              'Polling complete - no new messages and not processing',
-              {
-                totalMessages: currentMessageCount,
-                attempts: attempts + 1,
-                seenMessageIds: seenMessageIds.size,
-                lastMessageRequiresActivity: !!lastMessageActivity,
-                lastMessageActivityType: lastMessageActivity?.type,
-              },
-            );
             return messages;
           } else {
             // Ainda processando, continuar
@@ -1783,13 +1651,6 @@ export class WatsonxService {
         }
       }
     }
-
-    this.logger.log('Polling finished', {
-      attempts,
-      totalMessages: lastMessages.length,
-      seenMessageIds: seenMessageIds.size,
-      elapsed: Date.now() - startTime,
-    });
 
     return lastMessages;
   }
