@@ -16,6 +16,14 @@ export class CoreService {
 
   constructor(private readonly watsonxService: WatsonxService) {}
 
+  /**
+   * Verifica se uma sessão já tem um thread mapeado
+   * Usado pelo BrokerWidgetService para determinar isFirstMessage
+   */
+  hasExistingThread(sessionId: string): boolean {
+    return this.sessionThreadMap.has(sessionId);
+  }
+
   async run(
     payload: CoreRunDto,
     assistant: any, // Removido tipo Assistant estrito

@@ -69,6 +69,15 @@ export class WidgetMessageDto {
   avatar?: string;
 
   @ApiProperty({
+    description: 'Indica se a mensagem é de erro',
+    example: false,
+    required: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  isError?: boolean;
+
+  @ApiProperty({
     description: 'Tipo de componente (select, autocomplete, etc)',
     example: 'select',
     required: false,

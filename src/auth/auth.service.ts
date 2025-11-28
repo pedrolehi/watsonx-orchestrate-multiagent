@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { stringify } from 'qs';
+import { encryptValue } from '../helpers/crypto.helper';
 
 @Injectable()
 export class AuthService {
@@ -220,46 +221,107 @@ export class AuthService {
   }
 
   /**
-   * Identifica funcionário por CHAPA via senac-orchestrate
-   * Retorna dados do funcionário e acesso a relatórios financeiros
+   * Identifica funcionário por CHAPA diretamente na API do Senac
+   * Retorna dados do funcionário (criptografados) e acesso a relatórios
    */
   async identifyEmployee(chapa: string): Promise<{
     success: boolean;
     data?: any;
-    acessoRelatorios?: any;
+    acessoRelatorios?: {
+      status: number;
+      acessoTotal: boolean;
+      codPessoa?: number;
+      error?: string;
+    };
     error?: string;
   }> {
-    try {
-      const orchestrateUrl =
-        process.env.SENAC_ORCHESTRATE_URL || 'http://localhost:3001';
+    const apiUrl = process.env.AUTENTICA_USUARIO_URL;
+    const token = process.env.AUTENTICA_USUARIO_TOKEN;
 
+    if (!apiUrl || !token) {
+      this.logger.error(
+        'AUTENTICA_USUARIO_URL e AUTENTICA_USUARIO_TOKEN são necessários',
+      );
+      return {
+        success: false,
+        error: 'Configuração de autenticação incompleta',
+      };
+    }
+
+    try {
       this.logger.log(`🔐 Identificando funcionário por CHAPA: ${chapa}`);
 
-      const response = await axios.post(
-        `${orchestrateUrl}/tools/identify-employee`,
-        { chapa },
-        {
-          headers: { 'Content-Type': 'application/json' },
-          timeout: 30000,
+      const response = await axios({
+        method: 'GET',
+        url: apiUrl,
+        headers: {
+          token: token,
+          'Content-Type': 'application/json',
         },
+        data: JSON.stringify({ chapa: chapa || '' }),
+        timeout: 30000,
+      });
+
+      this.logger.debug(
+        'Resposta da API AUTENTICA_USUARIO (antes de criptografar)',
       );
 
-      if (response.data.status === 200 && response.data.data?.DADOS) {
+      // Criptografar dados sensíveis
+      if (response.data && response.data.DADOS) {
+        response.data.DADOS.CPF = await encryptValue(response.data.DADOS.CPF);
+        response.data.DADOS.EMAIL = await encryptValue(
+          response.data.DADOS.EMAIL,
+        );
+        response.data.DADOS.NOME = await encryptValue(response.data.DADOS.NOME);
+        if (
+          response.data.DADOS.NOME_SOCIAL &&
+          response.data.DADOS.NOME_SOCIAL !== ''
+        ) {
+          response.data.DADOS.NOME_SOCIAL = await encryptValue(
+            response.data.DADOS.NOME_SOCIAL,
+          );
+        }
+      }
+
+      if (response.data?.CODIGO === '200' || response.data?.CODIGO === 200) {
         this.logger.log(`✅ Funcionário identificado com sucesso`);
+
+        // Verificar acesso a relatórios financeiros em paralelo
+        let acessoRelatorios: any = null;
+        try {
+          acessoRelatorios = await this.checkFinancialReportsAccess(chapa);
+          this.logger.log(
+            `📊 Acesso a relatórios: ${acessoRelatorios.acessoTotal ? 'SIM' : 'NÃO'}`,
+          );
+        } catch (err) {
+          this.logger.warn(
+            'Erro ao verificar acesso a relatórios',
+            err.message,
+          );
+        }
+
         return {
           success: true,
-          data: response.data.data,
-          acessoRelatorios: response.data.acessoRelatorios,
+          data: response.data,
+          acessoRelatorios,
         };
       } else {
         this.logger.warn(`⚠️ Funcionário não encontrado ou erro na API`);
         return {
           success: false,
-          error: response.data.error || 'Funcionário não encontrado',
+          error: response.data?.MENSAGEM || 'Funcionário não encontrado',
         };
       }
     } catch (error) {
       this.logger.error(`❌ Erro ao identificar funcionário: ${error.message}`);
+
+      if (error.response?.status === 501) {
+        return {
+          success: false,
+          error: error.response.data?.MENSAGEM || 'Token inválido',
+        };
+      }
+
       return {
         success: false,
         error: error.message,
@@ -268,46 +330,301 @@ export class AuthService {
   }
 
   /**
-   * Identifica aluno por EMPLID via senac-orchestrate
-   * Retorna dados do aluno e matrículas
+   * Identifica aluno por EMPLID diretamente na API do Senac
+   * Retorna dados do aluno (criptografados)
    */
   async identifyStudent(emplid: string): Promise<{
     success: boolean;
     data?: any;
+    alunoMaiorDeIdade?: boolean;
     error?: string;
   }> {
-    try {
-      const orchestrateUrl =
-        process.env.SENAC_ORCHESTRATE_URL || 'http://localhost:3001';
+    const apiUrl = process.env.IDENTIFICA_ALUNO_URL;
+    const token = process.env.IDENTIFICA_ALUNO_TOKEN;
 
+    if (!apiUrl || !token) {
+      this.logger.error(
+        'IDENTIFICA_ALUNO_URL e IDENTIFICA_ALUNO_TOKEN são necessários',
+      );
+      return {
+        success: false,
+        error: 'Configuração de autenticação incompleta',
+      };
+    }
+
+    try {
       this.logger.log(`🎓 Identificando aluno por EMPLID: ${emplid}`);
 
-      const response = await axios.post(
-        `${orchestrateUrl}/tools/identify-student`,
-        { emplid },
-        {
-          headers: { 'Content-Type': 'application/json' },
-          timeout: 30000,
+      const response = await axios({
+        method: 'GET',
+        url: apiUrl,
+        headers: {
+          TOKEN: token,
+          'Content-Type': 'application/json',
         },
+        data: JSON.stringify({ emplid: emplid || '' }),
+        timeout: 30000,
+      });
+
+      this.logger.debug(
+        'Resposta da API IDENTIFICA_ALUNO (antes de criptografar)',
       );
 
-      if (response.data.status === 200) {
+      // Calcular se é maior de idade
+      const birthDate = response.data?.DADOS?.DATANASCIMENTO;
+      const alunoMaiorDeIdade = this.calculateIsAdult(birthDate);
+
+      // Criptografar dados sensíveis
+      if (response.data && response.data.DADOS) {
+        if (response.data.DADOS.CONTRATO) {
+          response.data.DADOS.CONTRATO = await encryptValue(
+            response.data.DADOS.CONTRATO,
+          );
+        }
+        response.data.DADOS.CPF = await encryptValue(response.data.DADOS.CPF);
+        response.data.DADOS.DATANASCIMENTO = await encryptValue(
+          response.data.DADOS.DATANASCIMENTO,
+        );
+        response.data.DADOS.EMAIL = await encryptValue(
+          response.data.DADOS.EMAIL,
+        );
+        response.data.DADOS.NOME = await encryptValue(response.data.DADOS.NOME);
+      }
+
+      if (response.data?.CODIGO === '200' || response.data?.CODIGO === 200) {
         this.logger.log(`✅ Aluno identificado com sucesso`);
         return {
           success: true,
           data: response.data,
+          alunoMaiorDeIdade,
         };
       } else {
         this.logger.warn(`⚠️ Aluno não encontrado ou erro na API`);
         return {
           success: false,
-          error: response.data.error || 'Aluno não encontrado',
+          error: response.data?.MENSAGEM || 'Aluno não encontrado',
         };
       }
     } catch (error) {
       this.logger.error(`❌ Erro ao identificar aluno: ${error.message}`);
+
+      if (error.response?.status === 501) {
+        return {
+          success: false,
+          error: error.response.data?.MENSAGEM || 'Token inválido',
+        };
+      }
+
       return {
         success: false,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Calcula se o aluno é maior de idade baseado na data de nascimento
+   */
+  private calculateIsAdult(birthDate?: string): boolean {
+    if (!birthDate) {
+      return false;
+    }
+
+    try {
+      const birth = new Date(birthDate);
+      const today = new Date();
+      const age = today.getFullYear() - birth.getFullYear();
+      const monthDiff = today.getMonth() - birth.getMonth();
+
+      if (
+        monthDiff < 0 ||
+        (monthDiff === 0 && today.getDate() < birth.getDate())
+      ) {
+        return age - 1 >= 18;
+      }
+
+      return age >= 18;
+    } catch (error) {
+      this.logger.warn('Erro ao calcular idade', { birthDate, error });
+      return false;
+    }
+  }
+
+  /**
+   * Obtém token 3scale para acessar APIs protegidas
+   */
+  private async get3scaleToken(): Promise<string | null> {
+    const tokenUrl = process.env.THREESCALE_TOKEN_URL;
+    const userKey = process.env.THREESCALE_USERKEY;
+    const user = process.env.THREESCALE_USER;
+    const password = process.env.THREESCALE_PASSWORD;
+
+    if (!tokenUrl || !userKey || !user || !password) {
+      this.logger.warn('Configuração 3scale incompleta');
+      return null;
+    }
+
+    try {
+      const response = await axios({
+        method: 'POST',
+        url: tokenUrl,
+        headers: {
+          'Content-Type': 'application/json',
+          user_key: userKey,
+        },
+        data: {
+          usuario: user,
+          senha: password,
+        },
+        timeout: 15000,
+      });
+
+      return response.data?.token || null;
+    } catch (error) {
+      this.logger.error('Erro ao obter token 3scale', error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Verifica se o funcionário tem acesso a relatórios financeiros
+   */
+  async checkFinancialReportsAccess(chapa: string): Promise<{
+    status: number;
+    acessoTotal: boolean;
+    codPessoa?: number;
+    error?: string;
+  }> {
+    const consultaUrl = process.env.CONSULTA_DADOS_USUARIO;
+    const relConciliacaoUrl = process.env.REL_CONCILIACAO_CAIXA_URL;
+    const relReversaoUrl = process.env.REL_REVERSAO_PGTO_URL;
+    const relCancelamentoUrl = process.env.REL_CANCELAMENTO_URL;
+    const relAnulacaoUrl = process.env.REL_ANULACAO_URL;
+    const cancelamentoUserKey = process.env.CANCELAMENTO_USERKEY;
+    const relUserKey = process.env.REL_USERKEY;
+    const ambiente = process.env.AMBIENTE;
+
+    // Verificar configuração mínima
+    if (!consultaUrl || !relConciliacaoUrl) {
+      this.logger.warn(
+        'Configuração incompleta para verificação de acesso a relatórios',
+      );
+      return {
+        status: 500,
+        acessoTotal: false,
+        error: 'Configuração incompleta',
+      };
+    }
+
+    try {
+      // Obter token 3scale
+      const token = await this.get3scaleToken();
+      if (!token) {
+        return {
+          status: 500,
+          acessoTotal: false,
+          error: 'Erro ao obter token 3scale',
+        };
+      }
+
+      // Consultar dados do usuário
+      const consultaResponse = await axios({
+        method: 'GET',
+        url: `${consultaUrl}?CodPessoaOrigem=${chapa}&DscOrigem=RHEV&DscDestino=CS&CodPessoaSecund=1`,
+        headers: {
+          accept: 'text/plain',
+          HeaderAuthorization: `jwt:${token}`,
+          ambiente: ambiente,
+          user_key: cancelamentoUserKey,
+        },
+        timeout: 30000,
+      });
+
+      const dadosUnicos = consultaResponse.data;
+      if (!dadosUnicos.data || dadosUnicos.data.length === 0) {
+        this.logger.warn('Dados do usuário não encontrados');
+        return {
+          status: 404,
+          acessoTotal: false,
+          error: 'Dados do usuário não encontrados',
+        };
+      }
+
+      // Processar registros - filtrar ativos
+      let registros = dadosUnicos.data;
+      if (registros.length > 1) {
+        const ativos = registros.filter(
+          (reg: any) => reg.codigoStatusRegistroOrigem === 'A',
+        );
+        if (ativos.length > 0) {
+          registros =
+            ativos.length > 1
+              ? ativos.sort(
+                  (a: any, b: any) =>
+                    new Date(b.dataInclusao).getTime() -
+                    new Date(a.dataInclusao).getTime(),
+                )
+              : ativos;
+        }
+      }
+
+      const codPessoa = registros[0].codigoPessoa;
+      this.logger.debug(`codPessoa selecionado: ${codPessoa}`);
+
+      // Verificar acesso aos 4 relatórios em paralelo
+      const [
+        resultConciliacao,
+        resultReversao,
+        resultCancelamento,
+        resultAnulacao,
+      ] = await Promise.all([
+        axios({
+          method: 'GET',
+          url: `${relConciliacaoUrl}?emplid=${codPessoa}`,
+          headers: { token, user_key: relUserKey },
+          timeout: 15000,
+        }).catch(() => ({ data: { DADOS: [] } })),
+        axios({
+          method: 'GET',
+          url: `${relReversaoUrl}?emplid=${codPessoa}`,
+          headers: { token, user_key: relUserKey },
+          timeout: 15000,
+        }).catch(() => ({ data: { DADOS: [] } })),
+        axios({
+          method: 'GET',
+          url: `${relCancelamentoUrl}?emplid=${codPessoa}`,
+          headers: { token, user_key: relUserKey },
+          timeout: 15000,
+        }).catch(() => ({ data: { DADOS: [] } })),
+        axios({
+          method: 'GET',
+          url: `${relAnulacaoUrl}?emplid=${codPessoa}`,
+          headers: { token, user_key: relUserKey },
+          timeout: 15000,
+        }).catch(() => ({ data: { DADOS: [] } })),
+      ]);
+
+      // IDs com acesso total garantido
+      const idsPermitidos = [1140131623, 1140356420, 1140241906, 1143133928];
+
+      // Verificar se tem acesso a todos os relatórios
+      const acessoTotal =
+        (resultConciliacao.data?.DADOS?.length > 0 &&
+          resultReversao.data?.DADOS?.length > 0 &&
+          resultCancelamento.data?.DADOS?.length > 0 &&
+          resultAnulacao.data?.DADOS?.length > 0) ||
+        idsPermitidos.includes(codPessoa);
+
+      return {
+        status: 200,
+        acessoTotal,
+        codPessoa,
+      };
+    } catch (error: any) {
+      this.logger.error('Erro em checkFinancialReportsAccess', error.message);
+      return {
+        status: error.response?.status || 500,
+        acessoTotal: false,
         error: error.message,
       };
     }

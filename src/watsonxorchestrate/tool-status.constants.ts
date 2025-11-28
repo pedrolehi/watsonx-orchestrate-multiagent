@@ -4,22 +4,22 @@
  */
 export const TOOL_STATUS_MAP: Record<string, string> = {
   // Autenticação
-  identify_employee: 'Autenticando usuário',
-  identify_student: 'Autenticando aluno',
+  identify_employee: 'Verificando credenciais do funcionário',
+  identify_student: 'Verificando credenciais do aluno',
 
   // Processamento de dados
-  decrypt_value: 'Processando dados',
+  decrypt_value: 'Descriptografando informações sensíveis',
 
   // Relatórios financeiros
-  check_financial_reports: 'Verificando permissões',
-  check_financial_reports_access: 'Verificando permissões',
+  check_financial_reports: 'Consultando permissões de acesso',
+  check_financial_reports_access: 'Consultando permissões de acesso',
 
   // Consultas genéricas
-  search: 'Buscando informações',
-  query: 'Consultando dados',
+  search: 'Buscando na base de dados',
+  query: 'Consultando informações',
 
   // Fallback
-  default: 'Processando',
+  default: 'Executando ação',
 };
 
 /**
@@ -42,6 +42,7 @@ export type StatusEventType =
   | 'status.started'
   | 'status.tool_call'
   | 'status.processing'
+  | 'status.thinking'
   | 'status.completed'
   | 'status.error';
 

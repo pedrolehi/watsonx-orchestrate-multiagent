@@ -9,12 +9,34 @@ async function bootstrap() {
 
   app.enableCors();
 
+  // Middleware para logar todas as requisições
+  app.use((req: any, res: any, next: any) => {
+    console.log('=== [MIDDLEWARE] Requisição recebida ===');
+    console.log('[MIDDLEWARE]', {
+      method: req.method,
+      url: req.url,
+      path: req.path,
+      originalUrl: req.originalUrl,
+      headers: {
+        'content-type': req.headers['content-type'],
+        accept: req.headers['accept'],
+      },
+      hasBody: !!req.body,
+      bodyKeys: req.body ? Object.keys(req.body) : [],
+    });
+    next();
+  });
+
   // patchNestJsSwagger(); // Desativado
 
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
       transform: true,
+      skipMissingProperties: false,
+      // Não validar se for multipart/form-data (será validado depois do multer)
+      skipNullProperties: false,
+      skipUndefinedProperties: false,
     }),
   );
 

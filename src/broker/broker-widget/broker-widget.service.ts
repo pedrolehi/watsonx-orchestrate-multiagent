@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { Observable, Subject } from 'rxjs';
+import { shareReplay } from 'rxjs/operators';
 import { AuthService } from '../../auth/auth.service';
 import { CoreService } from '../../core/core.service';
 import { CoreRunDto } from '../../core/dto/core.dto';
@@ -48,6 +49,15 @@ export class BrokerWidgetService {
     }
   }
 
+  /**
+   * Gera um código de erro único para rastreamento
+   */
+  private generateErrorCode(): string {
+    const timestamp = Date.now().toString(36).toUpperCase();
+    const random = Math.random().toString(36).substring(2, 6).toUpperCase();
+    return `ERR-AUTH-${timestamp}-${random}`;
+  }
+
   async auth(data: WidgetAuthDto): Promise<any> {
     this.logger.log('Widget authentication request', {
       apiKey: data['api-key'],
@@ -76,10 +86,9 @@ export class BrokerWidgetService {
 
     const hasFiles = !!files && files.length > 0;
 
-    // Incluir thread_id do contexto anterior se disponível (para manter a sessão)
-    const previousThreadId =
-      data.user?.thread_id || data.user?.context?.thread_id;
-    const isFirstMessage = !previousThreadId;
+    // Verificar se é a primeira mensagem baseado no mapeamento interno do CoreService
+    // O backend controla o thread_id, não o widget
+    const isFirstMessage = !this.coreService.hasExistingThread(data.sessionId);
 
     // Extrair apenas os valores essenciais para o contexto do agent
     const emplid = data.user?.emplid || data.user?.context?.emplid;
@@ -128,6 +137,41 @@ export class BrokerWidgetService {
             error: authError,
           });
         }
+      } else {
+        // Nenhum identificador fornecido
+        authError =
+          'Nenhum identificador de usuário fornecido (chapa ou emplid)';
+        this.logger.warn('Tentativa de acesso sem identificador de usuário');
+      }
+
+      // ===== BLOQUEAR ACESSO SE AUTENTICAÇÃO FALHOU =====
+      if (!userData) {
+        const errorCode = this.generateErrorCode();
+        this.logger.error('Acesso negado: usuário não autenticado', {
+          authError,
+          errorCode,
+        });
+
+        const errorDetails = authError
+          ? `\n\n**Detalhes do erro:** ${authError}`
+          : '';
+
+        return {
+          success: false,
+          messages: [
+            {
+              sender: 'ai',
+              message:
+                '**Não foi possível autenticar o usuário.**\n\nVocê não tem permissão de acesso aos recursos do assistente virtual. Verifique se está logado corretamente ou entre em contato com o suporte.' +
+                errorDetails +
+                `\n\n**Código do erro:** \`${errorCode}\``,
+              messageId: `error_${Date.now()}`,
+              timestamp: new Date().toISOString(),
+              isError: true,
+            },
+          ],
+          settings: {},
+        };
       }
     }
 
@@ -135,7 +179,6 @@ export class BrokerWidgetService {
     const userInfo: any = userData
       ? {
           ...userData,
-          // Incluir acesso a relatórios se disponível (funcionário)
           ...(acessoRelatorios && { acessoRelatorios }),
         }
       : null;
@@ -152,9 +195,7 @@ export class BrokerWidgetService {
         ...(agentId && { agent_id: agentId }),
         // Dados do usuário autenticado dentro de user_info
         ...(userInfo && { user_info: userInfo }),
-        // Thread ID para continuar a conversa
-        ...(previousThreadId && { thread_id: previousThreadId }),
-        // IMPORTANTE: is_first_message deve ser true APENAS na primeira chamada
+        // IMPORTANTE: is_first_message é determinado pelo backend via CoreService.hasExistingThread
         is_first_message: isFirstMessage,
         // Session ID para referência
         session_id: data.sessionId,
@@ -254,12 +295,114 @@ export class BrokerWidgetService {
     data: WidgetConversationDto,
     files?: Array<Express.Multer.File>,
   ): Observable<MessageEvent> {
+    console.log('[BrokerWidgetService] runWithStreaming chamado:', {
+      hasData: !!data,
+      hasFiles: !!files,
+      filesCount: files?.length || 0,
+    });
+
     const subject = new Subject<MessageEvent>();
 
-    // Executar o processamento de forma assíncrona
-    this.executeWithStatusEvents(data, files, subject);
+    // Determinar mensagem inicial baseada no contexto
+    const isFirstMessage = !this.coreService.hasExistingThread(data.sessionId);
+    const hasText = data.text && data.text.trim().length > 0;
 
-    return subject.asObservable();
+    let initialMessage = 'Preparando resposta';
+    if (isFirstMessage || !hasText) {
+      initialMessage = 'Inicializando assistente';
+    }
+
+    // Emitir evento inicial imediatamente para garantir que o SSE sempre tenha algo
+    const initialEvent = {
+      data: JSON.stringify({
+        event: 'status',
+        data: {
+          message: initialMessage,
+          timestamp: Date.now(),
+        },
+      }),
+    } as MessageEvent;
+
+    // Criar Observable que emite o evento inicial imediatamente quando alguém se inscreve
+    const observable = new Observable<MessageEvent>((subscriber) => {
+      console.log(
+        '[BrokerWidgetService] Observable subscribed - emitindo evento inicial',
+      );
+
+      // Emitir evento inicial imediatamente
+      subscriber.next(initialEvent);
+      console.log('[BrokerWidgetService] Evento inicial emitido:', {
+        hasData: !!initialEvent.data,
+        dataLength: initialEvent.data?.length,
+      });
+
+      // Fazer subscribe no subject para repassar eventos
+      const subscription = subject.subscribe({
+        next: (value) => {
+          console.log('[BrokerWidgetService] Repassando evento do subject:', {
+            hasData: !!value.data,
+            dataLength: value.data?.length,
+          });
+          subscriber.next(value);
+        },
+        error: (err) => {
+          console.error('[BrokerWidgetService] Erro no subject:', err);
+          subscriber.error(err);
+        },
+        complete: () => {
+          console.log('[BrokerWidgetService] Subject completado');
+          subscriber.complete();
+        },
+      });
+
+      // Executar o processamento de forma assíncrona
+      this.executeWithStatusEvents(data, files, subject).catch((error) => {
+        console.error(
+          '[BrokerWidgetService] Erro em executeWithStatusEvents:',
+          error,
+        );
+        const errorEvent = {
+          data: JSON.stringify({
+            event: 'error',
+            data: {
+              message: error.message || 'Erro ao processar requisição',
+              timestamp: Date.now(),
+            },
+          }),
+        } as MessageEvent;
+        subject.next(errorEvent);
+        subject.complete();
+      });
+
+      // Cleanup
+      return () => {
+        console.log('[BrokerWidgetService] Observable unsubscribe chamado');
+        subscription.unsubscribe();
+      };
+    });
+
+    console.log('[BrokerWidgetService] Observable criado e retornado');
+
+    // Fazer subscribe imediatamente para garantir que o Observable comece a emitir
+    // (O NestJS fará seu próprio subscribe, mas isso ajuda a garantir que os eventos sejam emitidos)
+    const testSub = observable.subscribe({
+      next: (value) => {
+        console.log('[BrokerWidgetService] Test subscribe - evento recebido:', {
+          hasData: !!value.data,
+          dataLength: value.data?.length,
+        });
+      },
+      error: (err) => {
+        console.error('[BrokerWidgetService] Test subscribe - erro:', err);
+      },
+      complete: () => {
+        console.log('[BrokerWidgetService] Test subscribe - completado');
+      },
+    });
+
+    // Não fazer unsubscribe - deixar o NestJS gerenciar
+
+    return observable;
   }
 
   /**
@@ -270,11 +413,13 @@ export class BrokerWidgetService {
     files: Array<Express.Multer.File> | undefined,
     subject: Subject<MessageEvent>,
   ): Promise<void> {
+    console.log('[BrokerWidgetService] executeWithStatusEvents iniciado');
     try {
-      // Incluir thread_id do contexto anterior se disponível
-      const previousThreadId =
-        data.user?.thread_id || data.user?.context?.thread_id;
-      const isFirstMessage = !previousThreadId;
+      // Verificar se é a primeira mensagem baseado no mapeamento interno do CoreService
+      // O backend controla o thread_id, não o widget
+      const isFirstMessage = !this.coreService.hasExistingThread(
+        data.sessionId,
+      );
 
       // Extrair apenas os valores essenciais para o contexto do agent
       const emplid = data.user?.emplid || data.user?.context?.emplid;
@@ -290,6 +435,7 @@ export class BrokerWidgetService {
       // ===== AUTENTICAÇÃO AUTOMÁTICA NA PRIMEIRA MENSAGEM =====
       let userData: any = null;
       let acessoRelatorios: any = null;
+      let authError: string | null = null;
 
       if (isFirstMessage) {
         if (chapa) {
@@ -302,6 +448,13 @@ export class BrokerWidgetService {
             userData = authResult.data;
             acessoRelatorios = authResult.acessoRelatorios;
             this.logger.log('Funcionário autenticado com sucesso');
+          } else {
+            authError =
+              authResult.error || 'Falha na autenticação do funcionário';
+            this.logger.warn('Falha na autenticação do funcionário', {
+              chapa,
+              error: authError,
+            });
           }
         } else if (emplid && emplid !== '0000000') {
           // Aluno: autenticar por EMPLID
@@ -312,7 +465,56 @@ export class BrokerWidgetService {
           if (authResult.success) {
             userData = authResult.data;
             this.logger.log('Aluno autenticado com sucesso');
+          } else {
+            authError = authResult.error || 'Falha na autenticação do aluno';
+            this.logger.warn('Falha na autenticação do aluno', {
+              emplid,
+              error: authError,
+            });
           }
+        } else {
+          // Nenhum identificador fornecido
+          authError =
+            'Nenhum identificador de usuário fornecido (chapa ou emplid)';
+          this.logger.warn('Tentativa de acesso sem identificador de usuário');
+        }
+
+        // ===== BLOQUEAR ACESSO SE AUTENTICAÇÃO FALHOU =====
+        if (!userData) {
+          const errorCode = this.generateErrorCode();
+          this.logger.error('Acesso negado: usuário não autenticado', {
+            authError,
+            errorCode,
+          });
+
+          const errorDetails = authError
+            ? `\n\n**Detalhes do erro:** ${authError}`
+            : '';
+
+          const errorMessage = {
+            sender: 'ai',
+            message:
+              '**Não foi possível autenticar o usuário.**\n\nVocê não tem permissão de acesso aos recursos do assistente virtual. Verifique se está logado corretamente ou entre em contato com o suporte.' +
+              errorDetails +
+              `\n\n**Código do erro:** \`${errorCode}\``,
+            messageId: `error_${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            isError: true,
+          };
+
+          const sseEvent = {
+            data: JSON.stringify({
+              event: 'response',
+              data: {
+                messages: [errorMessage],
+                settings: {},
+              },
+            }),
+          } as MessageEvent;
+
+          subject.next(sseEvent);
+          subject.complete();
+          return;
         }
       }
 
@@ -335,7 +537,8 @@ export class BrokerWidgetService {
           ...(agentId && { agent_id: agentId }),
           // Dados do usuário autenticado dentro de user_info
           ...(userInfo && { user_info: userInfo }),
-          ...(previousThreadId && { thread_id: previousThreadId }),
+          // thread_id é gerenciado internamente pelo CoreService
+          // is_first_message é determinado pelo backend via CoreService.hasExistingThread
           is_first_message: isFirstMessage,
           session_id: data.sessionId,
           // Saudação baseada na hora local do usuário
@@ -549,6 +752,9 @@ export class BrokerWidgetService {
     context: any,
   ): WidgetMessageDto | null {
     if (!message.text || message.text.trim() === '') return null;
+
+    // Normaliza quebras de linha escapadas
+    const normalizedText = this.normalizeNewlines(message.text);
     const nextMessage = messages[index + 1];
 
     const shouldRenderDatepicker =
@@ -564,7 +770,7 @@ export class BrokerWidgetService {
       if (context?.calendarioMesAno === true) context.calendarioMesAno = false;
       return {
         sender: 'ai',
-        message: message.text,
+        message: normalizedText,
         component: 'datepicker',
         options: { mode: 'month-year', constraints: constraints },
         messageId: randomUUID(),
@@ -577,7 +783,7 @@ export class BrokerWidgetService {
       if (context?.calendario === true) context.calendario = false;
       return {
         sender: 'ai',
-        message: message.text,
+        message: normalizedText,
         component: 'datepicker',
         options: { constraints: constraints },
         messageId: randomUUID(),
@@ -600,7 +806,7 @@ export class BrokerWidgetService {
 
         return {
           sender: 'ai',
-          message: message.text,
+          message: normalizedText,
           component: componentType,
           options: this.extractButtons(options),
           messageId: randomUUID(),
@@ -609,11 +815,14 @@ export class BrokerWidgetService {
       }
 
       if (!isNextMessageMultiselect) {
+        const nextTitle = nextMessage.title
+          ? this.normalizeNewlines(nextMessage.title)
+          : '';
         return {
           sender: 'ai',
-          message: nextMessage.title
-            ? `${message.text}\n\n${nextMessage.title}`
-            : message.text,
+          message: nextTitle
+            ? `${normalizedText}\n\n${nextTitle}`
+            : normalizedText,
           buttons: this.extractButtons(nextMessage.options),
           messageId: randomUUID(),
           timestamp: new Date().toISOString(),
@@ -623,7 +832,7 @@ export class BrokerWidgetService {
 
     return {
       sender: 'ai',
-      message: message.text,
+      message: normalizedText,
       messageId: randomUUID(),
       timestamp: new Date().toISOString(),
     };
@@ -641,8 +850,9 @@ export class BrokerWidgetService {
     if (isMultiselect) {
       let options = message.options || [];
       const componentType = options.length > 5 ? 'autocomplete' : 'select';
-      const finalTitle =
-        message.title || message.text || 'Selecione uma das opções:';
+      const finalTitle = this.normalizeNewlines(
+        message.title || message.text || 'Selecione uma das opções:',
+      );
       context.multiselect = false;
 
       return {
@@ -657,7 +867,9 @@ export class BrokerWidgetService {
 
     return {
       sender: 'ai',
-      message: message.title || message.text || 'Selecione uma opção:',
+      message: this.normalizeNewlines(
+        message.title || message.text || 'Selecione uma opção:',
+      ),
       buttons: this.extractButtons(message.options),
       messageId: randomUUID(),
       timestamp: new Date().toISOString(),
@@ -680,7 +892,7 @@ export class BrokerWidgetService {
   private processVideoMessage(message: any): any {
     return {
       sender: 'ai',
-      message: message.text || 'Vídeo',
+      message: this.normalizeNewlines(message.text || 'Vídeo'),
       video: {
         url: message.source || message.videoDetails?.source || '',
         title: message.title || message.videoDetails?.title || '',
@@ -700,7 +912,9 @@ export class BrokerWidgetService {
   private processFileUploadMessage(message: any): any {
     return {
       sender: 'ai',
-      message: message.text || 'Por favor, envie o arquivo solicitado.',
+      message: this.normalizeNewlines(
+        message.text || 'Por favor, envie o arquivo solicitado.',
+      ),
       component: 'file_upload',
       name: message.name, // Adicionar name no nível da mensagem para facilitar acesso
       options: {
@@ -715,7 +929,9 @@ export class BrokerWidgetService {
   private processDateMessage(message: any): any {
     return {
       sender: 'ai',
-      message: message.text || 'Por favor, selecione uma data.',
+      message: this.normalizeNewlines(
+        message.text || 'Por favor, selecione uma data.',
+      ),
       component: 'datepicker',
       name: message.name, // Nome do campo - IMPORTANTE para resposta
       options: {
@@ -812,6 +1028,16 @@ export class BrokerWidgetService {
       .replace(/\n/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  /**
+   * Normaliza quebras de linha escapadas (\\n) para quebras reais (\n)
+   * O Watson Orchestrate às vezes retorna \\n em vez de \n
+   */
+  private normalizeNewlines(text: string): string {
+    if (!text) return '';
+    // Converte \\n (escapado) para \n real
+    return text.replace(/\\n/g, '\n');
   }
 
   private extractButtons(options: any[]): any[] {

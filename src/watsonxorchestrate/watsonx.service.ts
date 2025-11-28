@@ -81,6 +81,82 @@ export class WatsonxService {
     );
   }
 
+  /**
+   * Processa texto de thinking/reasoning e transforma em mensagem amigável
+   * Remove termos técnicos e foca no que o agente está pensando/planejando
+   */
+  private processThinkingText(rawText: string): string {
+    if (!rawText || typeof rawText !== 'string') {
+      return 'Analisando contexto e planejando resposta';
+    }
+
+    let processed = rawText.trim();
+
+    // Remover termos técnicos comuns
+    const technicalTerms = [
+      /tool\s*\(/gi,
+      /function\s*\(/gi,
+      /call\s+/gi,
+      /api\s+call/gi,
+      /endpoint/gi,
+      /request/gi,
+      /response/gi,
+      /payload/gi,
+      /parameter/gi,
+      /variable/gi,
+      /context\s+variable/gi,
+      /step\s+\d+/gi,
+      /run\./gi,
+      /thread/gi,
+      /message\s+id/gi,
+    ];
+
+    technicalTerms.forEach((term) => {
+      processed = processed.replace(term, '');
+    });
+
+    // Transformar frases técnicas em linguagem natural
+    const replacements: [RegExp, string][] = [
+      [/vou\s+chamar|vou\s+usar|vou\s+executar/gi, 'vou'],
+      [
+        /preciso\s+obter|preciso\s+buscar|preciso\s+consultar/gi,
+        'preciso consultar',
+      ],
+      [/verificar\s+se|checar\s+se/gi, 'verificando'],
+      [/analisar\s+o|analisar\s+a/gi, 'analisando'],
+      [/processar\s+o|processar\s+a/gi, 'processando'],
+      [/retornar\s+o|retornar\s+a/gi, 'preparando'],
+    ];
+
+    replacements.forEach(([pattern, replacement]) => {
+      processed = processed.replace(pattern, replacement);
+    });
+
+    // Limpar espaços múltiplos e pontuação estranha
+    processed = processed
+      .replace(/\s+/g, ' ')
+      .replace(/\s*\.\s*\.\s*\./g, '')
+      .replace(/\s*,\s*,/g, ',')
+      .trim();
+
+    // Capitalizar primeira letra
+    if (processed.length > 0) {
+      processed = processed.charAt(0).toUpperCase() + processed.slice(1);
+    }
+
+    // Se o texto ficou muito curto ou vazio após processamento, usar fallback
+    if (processed.length < 10) {
+      return 'Analisando contexto e planejando resposta';
+    }
+
+    // Limitar tamanho para não ficar muito longo
+    if (processed.length > 100) {
+      processed = processed.substring(0, 97);
+    }
+
+    return processed;
+  }
+
   private async getIamToken(): Promise<string> {
     const now = Date.now() / 1000;
     if (this.iamToken && now < this.tokenExpiration) {
@@ -514,7 +590,7 @@ export class WatsonxService {
         onStatus({
           event: 'status.started',
           data: {
-            message: 'Processando',
+            message: 'Planejando próximos passos',
             timestamp: Date.now(),
           },
         });
@@ -623,7 +699,49 @@ export class WatsonxService {
                 messageId: messageCreated.id,
                 hasContent: !!messageCreated.content,
                 contentLength: messageCreated.content?.length || 0,
+                hasThinking: !!messageCreated.thinking,
               });
+            }
+
+            // Capturar thinking/reasoning steps
+            if (
+              eventType === 'message.thinking' ||
+              (eventData.data?.message?.thinking &&
+                eventData.data.message.thinking.length > 0)
+            ) {
+              const thinkingContent =
+                eventData.data?.message?.thinking ||
+                eventData.data?.thinking ||
+                [];
+
+              if (thinkingContent.length > 0 && onStatus) {
+                // Pegar o último thinking step
+                const lastThinking = Array.isArray(thinkingContent)
+                  ? thinkingContent[thinkingContent.length - 1]
+                  : thinkingContent;
+
+                const rawThinkingText =
+                  typeof lastThinking === 'string'
+                    ? lastThinking
+                    : lastThinking?.content || lastThinking?.text || '';
+
+                const thinkingText = rawThinkingText
+                  ? this.processThinkingText(rawThinkingText)
+                  : 'Analisando contexto e planejando resposta';
+
+                this.logger.log('[SSE] Thinking detected', {
+                  rawText: rawThinkingText.substring(0, 100),
+                  processedText: thinkingText,
+                });
+
+                onStatus({
+                  event: 'status.thinking',
+                  data: {
+                    message: thinkingText,
+                    timestamp: Date.now(),
+                  },
+                });
+              }
             }
 
             // Detectar tool_calls e emitir status
@@ -657,17 +775,77 @@ export class WatsonxService {
               }
 
               // Detectar thinking/processing em eventos de step
-              if (
+              // Evento específico: run.step.thinking
+              if (eventType === 'run.step.thinking') {
+                const thinkingContent =
+                  eventData.data?.thinking ||
+                  eventData.data?.step?.thinking ||
+                  eventData.data?.content ||
+                  eventData.data?.text;
+
+                if (thinkingContent && onStatus) {
+                  const rawThinkingText =
+                    typeof thinkingContent === 'string'
+                      ? thinkingContent
+                      : thinkingContent?.content || thinkingContent?.text || '';
+
+                  const thinkingText = rawThinkingText
+                    ? this.processThinkingText(rawThinkingText)
+                    : 'Analisando contexto e planejando resposta';
+
+                  this.logger.log('[SSE] Thinking event detected', {
+                    rawText: rawThinkingText.substring(0, 100),
+                    processedText: thinkingText,
+                  });
+
+                  onStatus({
+                    event: 'status.thinking',
+                    data: {
+                      message: thinkingText,
+                      timestamp: Date.now(),
+                    },
+                  });
+                }
+              } else if (
                 eventType === 'run.step.created' ||
                 eventType === 'run.step.in_progress'
               ) {
                 const stepType = eventData.data?.type;
-                if (stepType === 'tool_calls') {
+
+                // Verificar reasoning no step
+                const reasoning =
+                  eventData.data?.reasoning ||
+                  eventData.data?.step?.reasoning ||
+                  eventData.data?.step_details?.reasoning;
+
+                if (reasoning) {
+                  const rawReasoningText =
+                    typeof reasoning === 'string'
+                      ? reasoning
+                      : reasoning?.content || reasoning?.text || '';
+
+                  const reasoningText = rawReasoningText
+                    ? this.processThinkingText(rawReasoningText)
+                    : 'Raciocinando sobre a melhor abordagem';
+
+                  this.logger.log('[SSE] Reasoning detected in step', {
+                    rawText: rawReasoningText.substring(0, 100),
+                    processedText: reasoningText,
+                  });
+
+                  onStatus({
+                    event: 'status.thinking',
+                    data: {
+                      message: reasoningText,
+                      timestamp: Date.now(),
+                    },
+                  });
+                } else if (stepType === 'tool_calls') {
                   // Tool call em progresso sem detalhes específicos
                   onStatus({
                     event: 'status.processing',
                     data: {
-                      message: 'Processando',
+                      message: 'Consultando informações',
                       timestamp: Date.now(),
                     },
                   });
@@ -710,7 +888,7 @@ export class WatsonxService {
           onStatus({
             event: 'status.completed',
             data: {
-              message: 'Concluído',
+              message: 'Finalizando resposta',
               timestamp: Date.now(),
             },
           });
@@ -791,6 +969,46 @@ export class WatsonxService {
                     ? flowInstance.steps.length
                     : 0,
                 });
+
+                // Processar steps do flow instance para capturar thinking/reasoning
+                if (
+                  flowInstance.steps &&
+                  Array.isArray(flowInstance.steps) &&
+                  onStatus
+                ) {
+                  for (const step of flowInstance.steps) {
+                    // Verificar thinking/reasoning no step
+                    const thinking = step.thinking || step.reasoning;
+                    if (thinking) {
+                      const rawThinkingText =
+                        typeof thinking === 'string'
+                          ? thinking
+                          : thinking?.content || thinking?.text || '';
+
+                      const thinkingText = rawThinkingText
+                        ? this.processThinkingText(rawThinkingText)
+                        : 'Analisando contexto e planejando resposta';
+
+                      this.logger.log(
+                        '[Flow Instance] Thinking/Reasoning found in step',
+                        {
+                          stepId: step.id,
+                          stepType: step.type,
+                          rawText: rawThinkingText.substring(0, 100),
+                          processedText: thinkingText,
+                        },
+                      );
+
+                      onStatus({
+                        event: 'status.thinking',
+                        data: {
+                          message: thinkingText,
+                          timestamp: Date.now(),
+                        },
+                      });
+                    }
+                  }
+                }
               }
             } catch (flowError: any) {
               // API pode não estar disponível ou endpoint diferente - não é crítico
@@ -809,7 +1027,13 @@ export class WatsonxService {
           // Fazer polling para buscar mensagens adicionais
           if (threadId) {
             try {
-              const allMessages = await this.pollThreadMessages(threadId);
+              const allMessages = await this.pollThreadMessages(
+                threadId,
+                20,
+                2000,
+                60000,
+                onStatus,
+              );
               // Filtrar apenas mensagens do assistente
               const assistantMessages = allMessages.filter(
                 (msg: any) => msg.role === 'assistant',
@@ -922,27 +1146,41 @@ export class WatsonxService {
           // (pode haver options ou user activities em mensagens subsequentes)
           if (threadId) {
             try {
-              const allMessages = await this.pollThreadMessages(threadId);
+              const allMessages = await this.pollThreadMessages(
+                threadId,
+                20,
+                2000,
+                60000,
+                onStatus,
+              );
               const assistantMessages = allMessages.filter(
                 (msg: any) => msg.role === 'assistant',
               );
 
-              // Acumular todo o conteúdo das mensagens do assistente
+              // Pegar apenas a ÚLTIMA mensagem do assistente (a resposta atual)
+              // Não acumular todas as mensagens anteriores
+              const lastAssistantMessage =
+                assistantMessages[assistantMessages.length - 1];
+
               const allContent: any[] = [];
               const userActivities: any[] = [];
 
-              assistantMessages.forEach((msg: any) => {
+              if (lastAssistantMessage) {
                 // Detectar user activity
-                const userActivity = this.detectUserActivity(msg);
+                const userActivity =
+                  this.detectUserActivity(lastAssistantMessage);
                 if (userActivity) {
                   userActivities.push({
-                    messageId: msg.id,
+                    messageId: lastAssistantMessage.id,
                     ...userActivity,
                   });
                 }
 
-                if (msg.content && Array.isArray(msg.content)) {
-                  msg.content.forEach((item: any) => {
+                if (
+                  lastAssistantMessage.content &&
+                  Array.isArray(lastAssistantMessage.content)
+                ) {
+                  lastAssistantMessage.content.forEach((item: any) => {
                     // Preservar text e options quando ambos existirem
                     if (item.text && item.options) {
                       allContent.push({
@@ -955,7 +1193,7 @@ export class WatsonxService {
                     }
                   });
                 }
-              });
+              }
 
               // Adicionar user activities ao debug se houver
               if (userActivities.length > 0) {
@@ -1892,12 +2130,14 @@ export class WatsonxService {
    * @param maxAttempts - Número máximo de tentativas (default: 20)
    * @param intervalMs - Intervalo entre tentativas em ms (default: 2000)
    * @param timeoutMs - Timeout total em ms (default: 60000)
+   * @param onStatus - Callback opcional para eventos de status (thinking/reasoning)
    */
   private async pollThreadMessages(
     threadId: string,
     maxAttempts: number = 20,
     intervalMs: number = 2000,
     timeoutMs: number = 60000,
+    onStatus?: StatusCallback,
   ): Promise<any[]> {
     const startTime = Date.now();
     let seenMessageIds = new Set<string>();
@@ -1952,23 +2192,75 @@ export class WatsonxService {
               });
             }
 
+            // Verificar thinking/reasoning na mensagem
+            if (msg.thinking) {
+              this.logger.log('[Polling] Thinking found in message', {
+                messageId: msg.id,
+                thinking:
+                  typeof msg.thinking === 'string'
+                    ? msg.thinking.substring(0, 100)
+                    : JSON.stringify(msg.thinking).substring(0, 100),
+              });
+            }
+
+            if (msg.reasoning) {
+              this.logger.log('[Polling] Reasoning found in message', {
+                messageId: msg.id,
+                reasoning:
+                  typeof msg.reasoning === 'string'
+                    ? msg.reasoning.substring(0, 100)
+                    : JSON.stringify(msg.reasoning).substring(0, 100),
+              });
+            }
+
             // Capturar step_history se disponível
             if (msg.step_history && Array.isArray(msg.step_history)) {
               const stepDetails = msg.step_history.map((step: any) => {
+                // Verificar reasoning nos steps
+                if (step.reasoning) {
+                  this.logger.log('[Polling] Reasoning found in step_history', {
+                    messageId: msg.id,
+                    reasoning:
+                      typeof step.reasoning === 'string'
+                        ? step.reasoning.substring(0, 100)
+                        : JSON.stringify(step.reasoning).substring(0, 100),
+                  });
+                }
+
                 const details = Array.isArray(step.step_details)
-                  ? step.step_details.map((detail: any) => ({
-                      type: detail.type,
-                      tool_calls: detail.tool_calls
-                        ? detail.tool_calls.map((tc: any) => ({
-                            name: tc.name,
-                            id: tc.id,
-                            args: tc.args,
-                          }))
-                        : null,
-                      tool_output: detail.tool_output
-                        ? JSON.stringify(detail.tool_output).substring(0, 200)
-                        : null,
-                    }))
+                  ? step.step_details.map((detail: any) => {
+                      // Verificar reasoning nos step_details
+                      if (detail.reasoning) {
+                        this.logger.log(
+                          '[Polling] Reasoning found in step_details',
+                          {
+                            messageId: msg.id,
+                            reasoning:
+                              typeof detail.reasoning === 'string'
+                                ? detail.reasoning.substring(0, 100)
+                                : JSON.stringify(detail.reasoning).substring(
+                                    0,
+                                    100,
+                                  ),
+                          },
+                        );
+                      }
+
+                      return {
+                        type: detail.type,
+                        reasoning: detail.reasoning,
+                        tool_calls: detail.tool_calls
+                          ? detail.tool_calls.map((tc: any) => ({
+                              name: tc.name,
+                              id: tc.id,
+                              args: tc.args,
+                            }))
+                          : null,
+                        tool_output: detail.tool_output
+                          ? JSON.stringify(detail.tool_output).substring(0, 200)
+                          : null,
+                      };
+                    })
                   : [];
 
                 return {

@@ -2,10 +2,15 @@ import {
   Body,
   Controller,
   Post,
-  UploadedFiles,
   UseInterceptors,
-  Sse,
+  Req,
+  Res,
+  UploadedFiles,
+  CallHandler,
+  NestInterceptor,
+  ExecutionContext,
 } from '@nestjs/common';
+import { Response } from 'express';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import {
   ApiBody,
@@ -15,10 +20,34 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { memoryStorage } from 'multer';
+import multer from 'multer';
 import { Observable } from 'rxjs';
+import { promisify } from 'util';
 import { AuthService } from '../auth/auth.service';
 import { BrokerWidgetService } from './broker-widget/broker-widget.service';
 import { WidgetAuthDto } from './dto/widget-auth.dto';
+
+// Interceptor para processar FormData manualmente para streaming
+class FormDataStreamInterceptor implements NestInterceptor {
+  async intercept(
+    context: ExecutionContext,
+    next: CallHandler,
+  ): Promise<Observable<any>> {
+    const request = context.switchToHttp().getRequest();
+    const response = context.switchToHttp().getResponse();
+
+    // Processar FormData usando multer manualmente
+    const upload = multer({
+      storage: memoryStorage(),
+      limits: { fileSize: 10 * 1024 * 1024 },
+    }).any();
+
+    const multerAny = promisify(upload);
+    await multerAny(request, response);
+
+    return next.handle();
+  }
+}
 
 @Controller('broker')
 @ApiTags('Broker')
@@ -40,6 +69,7 @@ export class BrokerController {
     return this.brokerWidgetService.auth(body);
   }
 
+  // Endpoint normal (JSON) - sem streaming
   @Post('widget-conversation')
   @UseInterceptors(
     FilesInterceptor('files', 10, {
@@ -47,120 +77,82 @@ export class BrokerController {
       limits: { fileSize: 10 * 1024 * 1024 },
     }),
   )
-  @ApiOperation({ summary: 'Processar conversa do widget' })
+  @ApiOperation({ summary: 'Processar conversa do widget (JSON)' })
   @ApiResponse({ status: 201, description: 'Conversa processada com sucesso' })
   @ApiConsumes('multipart/form-data')
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        sender: {
-          type: 'string',
-          description: 'Quem está enviando a mensagem',
-          example: 'user',
-        },
-        text: {
-          type: 'string',
-          description: 'Texto da mensagem',
-          example: 'Olá, preciso de ajuda',
-        },
-        avatar: {
-          type: 'string',
-          description: 'URL do avatar do usuário',
-          example: 'https://example.com/avatar.jpg',
-        },
-        timestamp: {
-          type: 'string',
-          description: 'Timestamp da mensagem',
-          example: '2025-07-07T10:30:00.000Z',
-        },
-        sessionId: {
-          type: 'string',
-          description: 'ID da sessão/conversa',
-          example: 'session_123456',
-        },
-        assistantId: {
-          type: 'string',
-          description: 'ID do assistente',
-          example: 'assistant_watson_123',
-        },
-        files: {
-          type: 'array',
-          items: { type: 'string', format: 'binary' },
-          description: 'Arquivos opcionais (imagem, documento, etc.)',
-        },
-      },
-      required: ['sender', 'text', 'sessionId', 'assistantId'],
-    },
-  })
   async widget(
+    @Req() req: any,
     @Body() body: any,
     @UploadedFiles() files?: Array<Express.Multer.File>,
   ) {
-    if (!body || !body.message) {
+    const formData = req.body || body;
+
+    if (!formData?.message) {
       throw new Error('Mensagem não encontrada no corpo da requisição');
     }
 
-    try {
-      // Logs defensivos sobre arquivos recebidos
-      const hasFiles = Array.isArray(files) && files.length > 0;
-      if (hasFiles) {
-        console.debug(
-          '[BrokerController] Arquivos recebidos:',
-          files.map((f) => ({
-            name: f.originalname,
-            size: f.size,
-            mimetype: f.mimetype,
-            hasBuffer: !!f.buffer,
-          })),
-        );
-      }
-
-      // Parse da mensagem
-      const messageData = JSON.parse(body?.message);
-
-      // Processar mensagem sem validação de token
-      return this.brokerWidgetService.run(messageData, files);
-    } catch (error) {
-      console.error('Erro ao processar mensagem do widget:', error);
-      throw new Error('Erro ao processar mensagem');
-    }
+    const messageData = JSON.parse(formData.message);
+    return this.brokerWidgetService.run(messageData, files);
   }
 
-  /**
-   * Endpoint SSE para conversa com streaming de status
-   * Retorna eventos de status durante o processamento e a resposta final no fim
-   */
+  // Endpoint para streaming (SSE)
   @Post('widget-conversation-stream')
-  @UseInterceptors(
-    FilesInterceptor('files', 10, {
-      storage: memoryStorage(),
-      limits: { fileSize: 10 * 1024 * 1024 },
-    }),
-  )
-  @Sse()
-  @ApiOperation({
-    summary: 'Processar conversa do widget com streaming SSE de status',
-  })
+  @UseInterceptors(new FormDataStreamInterceptor())
+  @ApiOperation({ summary: 'Processar conversa do widget com streaming SSE' })
   @ApiResponse({
     status: 200,
     description: 'Stream SSE de eventos de status e resposta final',
   })
   @ApiConsumes('multipart/form-data')
-  widgetStream(
+  async widgetStream(
+    @Req() req: any,
+    @Res() res: Response,
     @Body() body: any,
-    @UploadedFiles() files?: Array<Express.Multer.File>,
-  ): Observable<MessageEvent> {
-    if (!body || !body.message) {
-      throw new Error('Mensagem não encontrada no corpo da requisição');
+  ): Promise<void> {
+    const files = (req.files as Array<Express.Multer.File>) || undefined;
+    const formData = req.body || body;
+
+    if (!formData?.message) {
+      res
+        .status(400)
+        .json({ error: 'Mensagem não encontrada no corpo da requisição' });
+      return;
     }
 
-    try {
-      const messageData = JSON.parse(body?.message);
-      return this.brokerWidgetService.runWithStreaming(messageData, files);
-    } catch (error) {
-      console.error('Erro ao processar streaming:', error);
-      throw new Error('Erro ao processar streaming');
-    }
+    const messageData = JSON.parse(formData.message);
+
+    // Configurar headers SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    // Fazer subscribe no Observable e escrever eventos SSE manualmente
+    const observable = this.brokerWidgetService.runWithStreaming(
+      messageData,
+      files,
+    );
+
+    observable.subscribe({
+      next: (event: MessageEvent) => {
+        res.write(`data: ${event.data}\n\n`);
+      },
+      error: (error) => {
+        const errorEvent = {
+          data: JSON.stringify({
+            event: 'error',
+            data: {
+              message: error.message || 'Erro ao processar requisição',
+              timestamp: Date.now(),
+            },
+          }),
+        };
+        res.write(`data: ${errorEvent.data}\n\n`);
+        res.end();
+      },
+      complete: () => {
+        res.end();
+      },
+    });
   }
 }
