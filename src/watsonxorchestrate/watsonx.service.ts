@@ -2,6 +2,12 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance } from 'axios';
 import { Readable } from 'stream';
+import { getToolStatusMessage, StatusEvent } from './tool-status.constants';
+
+/**
+ * Callback para eventos de status durante o processamento
+ */
+export type StatusCallback = (event: StatusEvent) => void;
 
 @Injectable()
 export class WatsonxService {
@@ -154,6 +160,296 @@ export class WatsonxService {
     }
   }
 
+  // Tipos de arquivo suportados pelo Watson Orchestrate
+  private readonly SUPPORTED_FILE_EXTENSIONS = [
+    '.csv',
+    '.doc',
+    '.docx',
+    '.jpeg',
+    '.jpg',
+    '.pdf',
+    '.png',
+    '.ppt',
+    '.pptx',
+    '.tiff',
+    '.tif',
+    '.txt',
+    '.wav',
+    '.xls',
+    '.xlsx',
+  ];
+
+  private readonly SUPPORTED_MIME_TYPES = [
+    'text/csv',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'image/jpeg',
+    'application/pdf',
+    'image/png',
+    'application/vnd.ms-powerpoint',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'image/tiff',
+    'text/plain',
+    'audio/wav',
+    'audio/wave',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ];
+
+  // Tamanho máximo do arquivo: 10 MB
+  private readonly MAX_FILE_SIZE = 10 * 1024 * 1024;
+
+  /**
+   * Valida se o arquivo é suportado pelo Watson Orchestrate
+   */
+  private validateFile(
+    fileName: string,
+    fileSize: number,
+    mimeType?: string,
+  ): { valid: boolean; error?: string } {
+    // Validar tamanho
+    if (fileSize > this.MAX_FILE_SIZE) {
+      return {
+        valid: false,
+        error: `Arquivo muito grande. Tamanho máximo: 10 MB. Tamanho do arquivo: ${(fileSize / 1024 / 1024).toFixed(2)} MB`,
+      };
+    }
+
+    // Validar extensão
+    const extension = fileName.toLowerCase().slice(fileName.lastIndexOf('.'));
+    if (!this.SUPPORTED_FILE_EXTENSIONS.includes(extension)) {
+      return {
+        valid: false,
+        error: `Tipo de arquivo não suportado: ${extension}. Tipos suportados: CSV, DOC, DOCX, JPEG, PDF, PNG, PPT, PPTX, TIFF, TXT, WAV, XLS, XLSX`,
+      };
+    }
+
+    // Validar MIME type se fornecido
+    if (mimeType && !this.SUPPORTED_MIME_TYPES.includes(mimeType)) {
+      this.logger.warn('MIME type não está na lista de suportados', {
+        mimeType,
+        fileName,
+      });
+      // Não bloquear, apenas avisar (alguns browsers enviam MIME types diferentes)
+    }
+
+    return { valid: true };
+  }
+
+  /**
+   * Sanitiza o nome do arquivo removendo caracteres não-ASCII
+   * O S3 da IBM não aceita caracteres acentuados nos metadados
+   */
+  private sanitizeFileName(fileName: string): string {
+    // Separar nome e extensão
+    const lastDotIndex = fileName.lastIndexOf('.');
+    const name = lastDotIndex > 0 ? fileName.slice(0, lastDotIndex) : fileName;
+    const extension = lastDotIndex > 0 ? fileName.slice(lastDotIndex) : '';
+
+    // Normalizar e remover acentos (NFD decompõe, regex remove diacríticos)
+    const sanitizedName = name
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') // Remove diacríticos (acentos)
+      .replace(/[^\x00-\x7F]/g, '_') // Substitui outros não-ASCII por underscore
+      .replace(/\s+/g, '_') // Substitui espaços por underscore
+      .replace(/_+/g, '_') // Remove underscores duplicados
+      .replace(/^_|_$/g, ''); // Remove underscores no início/fim
+
+    return sanitizedName + extension.toLowerCase();
+  }
+
+  /**
+   * Faz upload de arquivo para o S3 do Watson Orchestrate
+   * @param file - Arquivo a ser enviado (Buffer)
+   * @param fileName - Nome do arquivo
+   * @param mimeType - Tipo MIME do arquivo (ex: image/jpeg)
+   * @returns Dados do upload: { fileName, id, url, statusCode, invalid }
+   *
+   * Tipos suportados: CSV, DOC, DOCX, JPEG, PDF, PNG, PPT, PPTX, TIFF, TXT, WAV, XLS, XLSX
+   * Tamanho máximo: 10 MB
+   */
+  async uploadFileToS3(
+    file: Buffer,
+    fileName: string,
+    mimeType?: string,
+  ): Promise<{
+    fileName: string;
+    id: string | null;
+    url: string;
+    statusCode: number;
+    invalid: boolean;
+  }> {
+    // Validar arquivo antes do upload
+    const validation = this.validateFile(fileName, file.length, mimeType);
+    if (!validation.valid) {
+      this.logger.error('File validation failed', {
+        fileName,
+        error: validation.error,
+      });
+      throw new Error(validation.error);
+    }
+
+    try {
+      // Gerar ID único para o arquivo (usado no fileMetaData)
+      const fileId = require('crypto').randomUUID();
+
+      // Sanitizar nome do arquivo - S3 não aceita caracteres não-ASCII
+      const sanitizedFileName = this.sanitizeFileName(fileName);
+
+      this.logger.log('Uploading file to Watson Orchestrate S3', {
+        fileName,
+        sanitizedFileName,
+        fileId,
+        fileSize: file.length,
+        mimeType,
+      });
+
+      const FormData = require('form-data');
+      const formData = new FormData();
+
+      // Campo 'files' com o arquivo binário (usando nome sanitizado)
+      formData.append('files', file, {
+        filename: sanitizedFileName,
+        contentType: mimeType || 'application/octet-stream',
+      });
+
+      // Campo 'text' vazio
+      formData.append('text', '');
+
+      // Campo 'fileMetaData' com os metadados do arquivo (usando nome sanitizado)
+      const fileMetaData = [
+        {
+          fileName: sanitizedFileName,
+          invalid: false,
+          id: fileId,
+          statusCode: 200,
+          uploadStatus: 'uploading',
+          url: '',
+        },
+      ];
+      formData.append('fileMetaData', JSON.stringify(fileMetaData));
+
+      const response = await this.axiosInstance.post(
+        '/upload-to-s3',
+        formData,
+        {
+          headers: {
+            ...formData.getHeaders(),
+          },
+        },
+      );
+
+      this.logger.log('File uploaded to S3 successfully', {
+        fileName,
+        response: response.data,
+      });
+
+      // S3 retorna array: [{ fileName, id, url, errorBody, errorSubject, statusCode, invalid }]
+      const uploadResult = Array.isArray(response.data)
+        ? response.data[0]
+        : response.data;
+
+      return {
+        fileName: uploadResult.fileName || fileName,
+        id: uploadResult.id || null,
+        url: uploadResult.url || '',
+        statusCode: uploadResult.statusCode || 200,
+        invalid: uploadResult.invalid || false,
+      };
+    } catch (error: any) {
+      this.logger.error('Error uploading file to Watson Orchestrate S3', {
+        message: error.message,
+        response: error.response?.data,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Envia mensagem com arquivos anexados (resposta ao file_upload)
+   * @param agentId - ID do agente
+   * @param threadId - ID do thread
+   * @param uploadedFiles - Lista de arquivos já uploadados para S3
+   * @param uploadFieldId - ID do campo de upload (retornado no file_upload response como 'name')
+   * @param baseContext - Contexto base (opcional)
+   */
+  async sendMessageWithFiles(
+    agentId: string,
+    threadId: string,
+    uploadedFiles: Array<{
+      fileName: string;
+      id: string | null;
+      url: string;
+      statusCode: number;
+      invalid: boolean;
+    }>,
+    uploadFieldId: string,
+    baseContext?: any,
+  ): Promise<any> {
+    try {
+      this.logger.log('Sending message with files', {
+        agentId,
+        threadId,
+        uploadFieldId,
+        filesCount: uploadedFiles.length,
+      });
+
+      // Construir context.data no formato esperado pelo Watson Orchestrate
+      const contextData = {
+        data: [
+          {
+            id: uploadFieldId,
+            files: uploadedFiles,
+            type: 'file_download',
+          },
+        ],
+        source: 'TOOL',
+      };
+
+      const payload: any = {
+        message: {
+          role: 'user',
+          content: '', // Conteúdo vazio quando enviando arquivos
+        },
+        additional_properties: {},
+        agent_id: agentId,
+        thread_id: threadId,
+        context: {
+          ...(baseContext || {}),
+          ...contextData,
+        },
+      };
+
+      this.logger.debug('File upload payload', {
+        payload: JSON.stringify(payload),
+      });
+
+      const response = await this.axiosInstance.post('/runs', payload, {
+        params: {
+          stream: true,
+          stream_timeout: 120000,
+          multiple_content: true,
+        },
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        },
+        responseType: 'stream',
+      });
+
+      // Processar o stream SSE
+      return await this.processSSEStream(response.data);
+    } catch (error: any) {
+      this.logger.error('Error sending message with files', {
+        message: error.message,
+        response: error.response?.data,
+      });
+      throw error;
+    }
+  }
+
   /**
    * Envia mensagem com streaming (Server-Sent Events)
    * Processa o stream SSE e retorna a resposta completa
@@ -161,12 +457,14 @@ export class WatsonxService {
    * @param threadId - ID do thread (opcional, não enviado na primeira mensagem)
    * @param message - Conteúdo da mensagem
    * @param context - Contexto adicional (opcional)
+   * @param onStatus - Callback para eventos de status (opcional)
    */
   async sendMessageStream(
     agentId: string,
     threadId: string | undefined,
     message: string,
     context?: any,
+    onStatus?: StatusCallback,
   ): Promise<any> {
     try {
       this.logger.debug(
@@ -211,9 +509,30 @@ export class WatsonxService {
         responseType: 'stream',
       });
 
+      // Emitir status inicial
+      if (onStatus) {
+        onStatus({
+          event: 'status.started',
+          data: {
+            message: 'Processando',
+            timestamp: Date.now(),
+          },
+        });
+      }
+
       // Processar o stream SSE
-      return await this.processSSEStream(response.data);
+      return await this.processSSEStream(response.data, onStatus);
     } catch (error: any) {
+      // Emitir status de erro
+      if (onStatus) {
+        onStatus({
+          event: 'status.error',
+          data: {
+            message: 'Erro ao processar',
+            timestamp: Date.now(),
+          },
+        });
+      }
       // Quando responseType é 'stream', error.response.data é um stream, precisamos lê-lo
       let errorBody = error.message;
       if (
@@ -247,8 +566,12 @@ export class WatsonxService {
   /**
    * Processa um stream SSE (Server-Sent Events) e retorna a resposta completa
    * @param stream - Stream do axios
+   * @param onStatus - Callback para eventos de status (opcional)
    */
-  private async processSSEStream(stream: Readable): Promise<any> {
+  private async processSSEStream(
+    stream: Readable,
+    onStatus?: StatusCallback,
+  ): Promise<any> {
     return new Promise((resolve, reject) => {
       let buffer = '';
       let threadId: string | null = null;
@@ -303,6 +626,55 @@ export class WatsonxService {
               });
             }
 
+            // Detectar tool_calls e emitir status
+            if (onStatus) {
+              // Detectar tool_calls em run.step.created ou eventos similares
+              const stepDetails =
+                eventData.data?.step_details ||
+                eventData.data?.message?.step_details;
+              if (stepDetails && Array.isArray(stepDetails)) {
+                for (const detail of stepDetails) {
+                  if (detail.type === 'tool_calls' && detail.tool_calls) {
+                    for (const toolCall of detail.tool_calls) {
+                      const toolName = toolCall.name || toolCall.function?.name;
+                      if (toolName) {
+                        const statusMessage = getToolStatusMessage(toolName);
+                        this.logger.log(
+                          `[SSE] Tool call detected: ${toolName} -> "${statusMessage}"`,
+                        );
+                        onStatus({
+                          event: 'status.tool_call',
+                          data: {
+                            message: statusMessage,
+                            toolName,
+                            timestamp: Date.now(),
+                          },
+                        });
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Detectar thinking/processing em eventos de step
+              if (
+                eventType === 'run.step.created' ||
+                eventType === 'run.step.in_progress'
+              ) {
+                const stepType = eventData.data?.type;
+                if (stepType === 'tool_calls') {
+                  // Tool call em progresso sem detalhes específicos
+                  onStatus({
+                    event: 'status.processing',
+                    data: {
+                      message: 'Processando',
+                      timestamp: Date.now(),
+                    },
+                  });
+                }
+              }
+            }
+
             // Log do conteúdo quando disponível
             if (eventData.data?.message?.content) {
               this.logger.debug('Message content', {
@@ -332,6 +704,17 @@ export class WatsonxService {
           totalEvents: allEvents.length,
           hasMessageCreated: !!messageCreated,
         });
+
+        // Emitir status de conclusão
+        if (onStatus) {
+          onStatus({
+            event: 'status.completed',
+            data: {
+              message: 'Concluído',
+              timestamp: Date.now(),
+            },
+          });
+        }
 
         // Construir resposta simples com o que recebemos
         let response: any = {
@@ -433,7 +816,7 @@ export class WatsonxService {
               );
 
               // Filtrar mensagens que não são de "Tool is processing"
-              const finalMessages = assistantMessages.filter((msg: any) => {
+              const validMessages = assistantMessages.filter((msg: any) => {
                 const hasProcessingText = msg.content?.some(
                   (item: any) =>
                     item.text?.includes('Tool is processing') ||
@@ -441,6 +824,13 @@ export class WatsonxService {
                 );
                 return !hasProcessingText;
               });
+
+              // IMPORTANTE: Pegar apenas a ÚLTIMA mensagem do assistente
+              // Evita duplicação ao continuar conversas existentes
+              const finalMessages =
+                validMessages.length > 0
+                  ? [validMessages[validMessages.length - 1]]
+                  : [];
 
               // Acumular todo o conteúdo das mensagens finais
               // Preservar text quando existir junto com options ou outros tipos
@@ -1707,7 +2097,9 @@ export class WatsonxService {
       }
 
       // Tipo: datepicker (calendário)
+      // Watson pode retornar como 'date' ou 'datepicker'
       if (
+        item.response_type === 'date' ||
         item.response_type === 'datepicker' ||
         item.type === 'datepicker' ||
         (item.name && item.name.includes('date'))

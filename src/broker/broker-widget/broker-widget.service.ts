@@ -1,7 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
+import { Observable, Subject } from 'rxjs';
+import { AuthService } from '../../auth/auth.service';
 import { CoreService } from '../../core/core.service';
 import { CoreRunDto } from '../../core/dto/core.dto';
+import { StatusEvent } from '../../watsonxorchestrate/tool-status.constants';
 import { WidgetAuthDto } from '../dto/widget-auth.dto';
 import {
   WidgetContextDto,
@@ -11,11 +14,39 @@ import {
 } from '../dto/widget-conversation-response.dto';
 import { WidgetConversationDto } from '../dto/widget-conversation.dto';
 
+/**
+ * Evento SSE para o widget
+ */
+export interface WidgetSSEEvent {
+  event: string;
+  data: any;
+}
+
 @Injectable()
 export class BrokerWidgetService {
   private readonly logger = new Logger(BrokerWidgetService.name);
 
-  constructor(private readonly coreService: CoreService) {}
+  constructor(
+    private readonly coreService: CoreService,
+    private readonly authService: AuthService,
+  ) {}
+
+  /**
+   * Retorna saudação baseada na hora atual
+   * Bom dia: 5h - 11h59
+   * Boa tarde: 12h - 17h59
+   * Boa noite: 18h - 4h59
+   */
+  private getGreetingByTime(): string {
+    const hour = new Date().getHours();
+    if (hour >= 5 && hour < 12) {
+      return 'Bom dia';
+    } else if (hour >= 12 && hour < 18) {
+      return 'Boa tarde';
+    } else {
+      return 'Boa noite';
+    }
+  }
 
   async auth(data: WidgetAuthDto): Promise<any> {
     this.logger.log('Widget authentication request', {
@@ -56,6 +87,59 @@ export class BrokerWidgetService {
     // assistantId é o UUID do agent no Watson Orchestrate
     const agentId = data.assistantId;
 
+    // Saudação: usar do widget (hora local do usuário) ou calcular no servidor como fallback
+    const greeting =
+      data.user?.greeting ||
+      data.user?.context?.greeting ||
+      this.getGreetingByTime();
+
+    // ===== AUTENTICAÇÃO AUTOMÁTICA NA PRIMEIRA MENSAGEM =====
+    // Autentica o usuário ANTES de enviar para a LLM, eliminando a necessidade
+    // da LLM chamar tools de autenticação e melhorando a performance.
+    let userData: any = null;
+    let acessoRelatorios: any = null;
+    let authError: string | null = null;
+
+    if (isFirstMessage) {
+      if (chapa) {
+        // Funcionário: autenticar por CHAPA
+        this.logger.log('Autenticando funcionário por CHAPA', { chapa });
+        const authResult = await this.authService.identifyEmployee(chapa);
+        if (authResult.success) {
+          userData = authResult.data;
+          acessoRelatorios = authResult.acessoRelatorios;
+          this.logger.log('Funcionário autenticado com sucesso');
+        } else {
+          authError = authResult.error || null;
+          this.logger.warn('Falha na autenticação do funcionário', {
+            error: authError,
+          });
+        }
+      } else if (emplid && emplid !== '0000000') {
+        // Aluno: autenticar por EMPLID (ignorar emplid placeholder "0000000")
+        this.logger.log('Autenticando aluno por EMPLID', { emplid });
+        const authResult = await this.authService.identifyStudent(emplid);
+        if (authResult.success) {
+          userData = authResult.data;
+          this.logger.log('Aluno autenticado com sucesso');
+        } else {
+          authError = authResult.error || null;
+          this.logger.warn('Falha na autenticação do aluno', {
+            error: authError,
+          });
+        }
+      }
+    }
+
+    // Construir user_info com dados do usuário autenticado
+    const userInfo: any = userData
+      ? {
+          ...userData,
+          // Incluir acesso a relatórios se disponível (funcionário)
+          ...(acessoRelatorios && { acessoRelatorios }),
+        }
+      : null;
+
     const payload: CoreRunDto = {
       message: {
         type: 'text',
@@ -66,15 +150,16 @@ export class BrokerWidgetService {
       context: {
         // agent_id é o UUID do agent no Watson Orchestrate (enviado pelo widget como assistantId)
         ...(agentId && { agent_id: agentId }),
-        // Dados de identificação do usuário (apenas um será preenchido)
-        ...(emplid && { emplid }),
-        ...(chapa && { chapa }),
-        // Thread ID para continuar a conversa (enviado via header X-IBM-THREAD-ID também)
+        // Dados do usuário autenticado dentro de user_info
+        ...(userInfo && { user_info: userInfo }),
+        // Thread ID para continuar a conversa
         ...(previousThreadId && { thread_id: previousThreadId }),
         // IMPORTANTE: is_first_message deve ser true APENAS na primeira chamada
         is_first_message: isFirstMessage,
         // Session ID para referência
         session_id: data.sessionId,
+        // Saudação baseada na hora local do usuário (Bom dia, Boa tarde, Boa noite)
+        greeting: greeting,
       },
       channel: 'widget',
     };
@@ -105,6 +190,27 @@ export class BrokerWidgetService {
       Object.keys(coreResponse.settings).length > 0
     ) {
       response.settings = coreResponse.settings;
+    }
+
+    // Verificar se há mensagem de file_upload para ativar botão de anexos
+    // O botão só aparece quando o agente pede um arquivo e desaparece após enviar
+    const fileUploadMessage = standardizedData.messages.find(
+      (msg) => msg.component === 'file_upload',
+    );
+    const hasFileUpload = !!fileUploadMessage;
+    response.settings = {
+      ...response.settings,
+      botaoAnexo: hasFileUpload, // true só quando agente pede arquivo, false caso contrário
+      // Passar o ID do campo de upload para o widget usar ao enviar arquivos
+      ...(hasFileUpload &&
+        fileUploadMessage?.name && {
+          uploadFieldId: fileUploadMessage.name,
+        }),
+    };
+    if (hasFileUpload) {
+      this.logger.log('File upload detected, enabling attachment button', {
+        uploadFieldId: fileUploadMessage?.name,
+      });
     }
 
     // Adicionar contexto para debug no frontend
@@ -138,6 +244,183 @@ export class BrokerWidgetService {
     this.logger.log('Response', { messages: response.messages.length });
 
     return response;
+  }
+
+  /**
+   * Executa a conversa com streaming SSE
+   * Emite eventos de status durante o processamento e a resposta final no fim
+   */
+  runWithStreaming(
+    data: WidgetConversationDto,
+    files?: Array<Express.Multer.File>,
+  ): Observable<MessageEvent> {
+    const subject = new Subject<MessageEvent>();
+
+    // Executar o processamento de forma assíncrona
+    this.executeWithStatusEvents(data, files, subject);
+
+    return subject.asObservable();
+  }
+
+  /**
+   * Executa o processamento e emite eventos SSE
+   */
+  private async executeWithStatusEvents(
+    data: WidgetConversationDto,
+    files: Array<Express.Multer.File> | undefined,
+    subject: Subject<MessageEvent>,
+  ): Promise<void> {
+    try {
+      // Incluir thread_id do contexto anterior se disponível
+      const previousThreadId =
+        data.user?.thread_id || data.user?.context?.thread_id;
+      const isFirstMessage = !previousThreadId;
+
+      // Extrair apenas os valores essenciais para o contexto do agent
+      const emplid = data.user?.emplid || data.user?.context?.emplid;
+      const chapa = data.user?.chapa || data.user?.context?.chapa;
+      const agentId = data.assistantId;
+
+      // Saudação: usar do widget (hora local do usuário) ou calcular no servidor como fallback
+      const greeting =
+        data.user?.greeting ||
+        data.user?.context?.greeting ||
+        this.getGreetingByTime();
+
+      // ===== AUTENTICAÇÃO AUTOMÁTICA NA PRIMEIRA MENSAGEM =====
+      let userData: any = null;
+      let acessoRelatorios: any = null;
+
+      if (isFirstMessage) {
+        if (chapa) {
+          // Funcionário: autenticar por CHAPA
+          this.logger.log('Autenticando funcionário por CHAPA (streaming)', {
+            chapa,
+          });
+          const authResult = await this.authService.identifyEmployee(chapa);
+          if (authResult.success) {
+            userData = authResult.data;
+            acessoRelatorios = authResult.acessoRelatorios;
+            this.logger.log('Funcionário autenticado com sucesso');
+          }
+        } else if (emplid && emplid !== '0000000') {
+          // Aluno: autenticar por EMPLID
+          this.logger.log('Autenticando aluno por EMPLID (streaming)', {
+            emplid,
+          });
+          const authResult = await this.authService.identifyStudent(emplid);
+          if (authResult.success) {
+            userData = authResult.data;
+            this.logger.log('Aluno autenticado com sucesso');
+          }
+        }
+      }
+
+      // Construir user_info com dados do usuário autenticado
+      const userInfo: any = userData
+        ? {
+            ...userData,
+            ...(acessoRelatorios && { acessoRelatorios }),
+          }
+        : null;
+
+      const payload: CoreRunDto = {
+        message: {
+          type: 'text',
+          text: this.sanitizeTextForWatson(data.text || ''),
+        },
+        conversationId: data.sessionId,
+        profileName: 'Widget User',
+        context: {
+          ...(agentId && { agent_id: agentId }),
+          // Dados do usuário autenticado dentro de user_info
+          ...(userInfo && { user_info: userInfo }),
+          ...(previousThreadId && { thread_id: previousThreadId }),
+          is_first_message: isFirstMessage,
+          session_id: data.sessionId,
+          // Saudação baseada na hora local do usuário
+          greeting: greeting,
+        },
+        channel: 'widget',
+      };
+
+      // Callback para emitir eventos de status
+      const onStatus = (statusEvent: StatusEvent) => {
+        const sseEvent = {
+          data: JSON.stringify({
+            event: 'status',
+            data: {
+              message: statusEvent.data.message,
+              toolName: statusEvent.data.toolName,
+              timestamp: statusEvent.data.timestamp,
+              type: statusEvent.event,
+            },
+          }),
+        } as MessageEvent;
+        subject.next(sseEvent);
+      };
+
+      // Chamar o CoreService com callback de status
+      const coreResponse = await this.coreService.run(
+        payload,
+        null,
+        files,
+        onStatus,
+      );
+
+      // Processar resposta final
+      const standardizedData = this.standardizeWatsonResponse(
+        coreResponse.response,
+        coreResponse.context,
+      );
+
+      // Verificar se há file_upload para ativar botão
+      const fileUploadMessage = standardizedData.messages.find(
+        (msg) => msg.component === 'file_upload',
+      );
+      const hasFileUpload = !!fileUploadMessage;
+
+      const response: WidgetConversationResponseDto = {
+        success: true,
+        messages: standardizedData.messages,
+        settings: {
+          botaoAnexo: hasFileUpload, // true só quando agente pede arquivo
+          // Passar o ID do campo de upload para o widget usar ao enviar arquivos
+          ...(hasFileUpload &&
+            fileUploadMessage?.name && {
+              uploadFieldId: fileUploadMessage.name,
+            }),
+        } as WidgetSettingsDto,
+        context: coreResponse.context as WidgetContextDto,
+      };
+
+      // Emitir resposta final
+      const finalEvent = {
+        data: JSON.stringify({
+          event: 'response',
+          data: response,
+        }),
+      } as MessageEvent;
+      subject.next(finalEvent);
+
+      // Completar o stream
+      subject.complete();
+    } catch (error: any) {
+      this.logger.error('Error in streaming execution', error);
+
+      // Emitir evento de erro
+      const errorEvent = {
+        data: JSON.stringify({
+          event: 'error',
+          data: {
+            message: 'Erro ao processar mensagem',
+            error: error.message,
+          },
+        }),
+      } as MessageEvent;
+      subject.next(errorEvent);
+      subject.complete();
+    }
   }
 
   // --- Métodos Auxiliares de Transformação de UI (Mantidos do Legado para compatibilidade com Widget) ---
@@ -224,6 +507,10 @@ export class BrokerWidgetService {
         return this.processVideoMessage(message);
       case 'image':
         return this.processImageMessage(message);
+      case 'file_upload':
+        return this.processFileUploadMessage(message);
+      case 'date':
+        return this.processDateMessage(message);
       case 'pause':
         return null;
       default:
@@ -243,6 +530,11 @@ export class BrokerWidgetService {
         return this.processVideo(output);
       case 'image':
         return this.processImage(output);
+      case 'file_upload':
+        return this.processFileUpload(output);
+      case 'date':
+      case 'datepicker':
+        return this.processDate(output);
       case 'pause':
         return null;
       default:
@@ -400,6 +692,41 @@ export class BrokerWidgetService {
     };
   }
 
+  /**
+   * Processa mensagem de file_upload do Watson Orchestrate
+   * Ativa o botão de attachments no widget
+   * O campo 'name' é importante - deve ser enviado de volta ao fazer upload
+   */
+  private processFileUploadMessage(message: any): any {
+    return {
+      sender: 'ai',
+      message: message.text || 'Por favor, envie o arquivo solicitado.',
+      component: 'file_upload',
+      name: message.name, // Adicionar name no nível da mensagem para facilitar acesso
+      options: {
+        name: message.name, // Nome do campo de upload - IMPORTANTE para resposta
+        uploadFieldName: message.name, // Alias para facilitar uso no widget
+      },
+      messageId: randomUUID(),
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  private processDateMessage(message: any): any {
+    return {
+      sender: 'ai',
+      message: message.text || 'Por favor, selecione uma data.',
+      component: 'datepicker',
+      name: message.name, // Nome do campo - IMPORTANTE para resposta
+      options: {
+        name: message.name,
+        constraints: {}, // Pode ser expandido com constraints do Watson se disponíveis
+      },
+      messageId: randomUUID(),
+      timestamp: new Date().toISOString(),
+    };
+  }
+
   private processText(output: any, context: any): any {
     // Simplificado: reutilizando lógica similar se necessário, ou retornando simples
     return {
@@ -442,6 +769,34 @@ export class BrokerWidgetService {
         url: output.source,
         title: output.title,
         description: output.description,
+      },
+      messageId: randomUUID(),
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  private processFileUpload(output: any): any {
+    return {
+      sender: 'ai',
+      message: output.text || 'Por favor, envie o arquivo solicitado.',
+      component: 'file_upload',
+      options: {
+        name: output.name,
+      },
+      messageId: randomUUID(),
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  private processDate(output: any): any {
+    return {
+      sender: 'ai',
+      message: output.text || 'Por favor, selecione uma data.',
+      component: 'datepicker',
+      name: output.name, // Nome do campo - IMPORTANTE para resposta
+      options: {
+        name: output.name,
+        constraints: output.constraints || {},
       },
       messageId: randomUUID(),
       timestamp: new Date().toISOString(),

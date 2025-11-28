@@ -218,4 +218,98 @@ export class AuthService {
       resource_access: tokenData.resource_access,
     };
   }
+
+  /**
+   * Identifica funcionário por CHAPA via senac-orchestrate
+   * Retorna dados do funcionário e acesso a relatórios financeiros
+   */
+  async identifyEmployee(chapa: string): Promise<{
+    success: boolean;
+    data?: any;
+    acessoRelatorios?: any;
+    error?: string;
+  }> {
+    try {
+      const orchestrateUrl =
+        process.env.SENAC_ORCHESTRATE_URL || 'http://localhost:3001';
+
+      this.logger.log(`🔐 Identificando funcionário por CHAPA: ${chapa}`);
+
+      const response = await axios.post(
+        `${orchestrateUrl}/tools/identify-employee`,
+        { chapa },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 30000,
+        },
+      );
+
+      if (response.data.status === 200 && response.data.data?.DADOS) {
+        this.logger.log(`✅ Funcionário identificado com sucesso`);
+        return {
+          success: true,
+          data: response.data.data,
+          acessoRelatorios: response.data.acessoRelatorios,
+        };
+      } else {
+        this.logger.warn(`⚠️ Funcionário não encontrado ou erro na API`);
+        return {
+          success: false,
+          error: response.data.error || 'Funcionário não encontrado',
+        };
+      }
+    } catch (error) {
+      this.logger.error(`❌ Erro ao identificar funcionário: ${error.message}`);
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Identifica aluno por EMPLID via senac-orchestrate
+   * Retorna dados do aluno e matrículas
+   */
+  async identifyStudent(emplid: string): Promise<{
+    success: boolean;
+    data?: any;
+    error?: string;
+  }> {
+    try {
+      const orchestrateUrl =
+        process.env.SENAC_ORCHESTRATE_URL || 'http://localhost:3001';
+
+      this.logger.log(`🎓 Identificando aluno por EMPLID: ${emplid}`);
+
+      const response = await axios.post(
+        `${orchestrateUrl}/tools/identify-student`,
+        { emplid },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 30000,
+        },
+      );
+
+      if (response.data.status === 200) {
+        this.logger.log(`✅ Aluno identificado com sucesso`);
+        return {
+          success: true,
+          data: response.data,
+        };
+      } else {
+        this.logger.warn(`⚠️ Aluno não encontrado ou erro na API`);
+        return {
+          success: false,
+          error: response.data.error || 'Aluno não encontrado',
+        };
+      }
+    } catch (error) {
+      this.logger.error(`❌ Erro ao identificar aluno: ${error.message}`);
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
+  }
 }

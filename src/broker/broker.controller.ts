@@ -15,7 +15,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { memoryStorage } from 'multer';
-import { Observable, interval, map } from 'rxjs';
+import { Observable } from 'rxjs';
 import { AuthService } from '../auth/auth.service';
 import { BrokerWidgetService } from './broker-widget/broker-widget.service';
 import { WidgetAuthDto } from './dto/widget-auth.dto';
@@ -127,12 +127,40 @@ export class BrokerController {
     }
   }
 
-  @Sse('stream')
-  @ApiOperation({ summary: 'Endpoint de Streaming SSE para mensagens' })
-  sse(): Observable<MessageEvent> {
-    // Placeholder: Exemplo de stream a cada segundo
-    return interval(1000).pipe(
-      map((_) => ({ data: { hello: 'world' } }) as MessageEvent),
-    );
+  /**
+   * Endpoint SSE para conversa com streaming de status
+   * Retorna eventos de status durante o processamento e a resposta final no fim
+   */
+  @Post('widget-conversation-stream')
+  @UseInterceptors(
+    FilesInterceptor('files', 10, {
+      storage: memoryStorage(),
+      limits: { fileSize: 10 * 1024 * 1024 },
+    }),
+  )
+  @Sse()
+  @ApiOperation({
+    summary: 'Processar conversa do widget com streaming SSE de status',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Stream SSE de eventos de status e resposta final',
+  })
+  @ApiConsumes('multipart/form-data')
+  widgetStream(
+    @Body() body: any,
+    @UploadedFiles() files?: Array<Express.Multer.File>,
+  ): Observable<MessageEvent> {
+    if (!body || !body.message) {
+      throw new Error('Mensagem não encontrada no corpo da requisição');
+    }
+
+    try {
+      const messageData = JSON.parse(body?.message);
+      return this.brokerWidgetService.runWithStreaming(messageData, files);
+    } catch (error) {
+      console.error('Erro ao processar streaming:', error);
+      throw new Error('Erro ao processar streaming');
+    }
   }
 }

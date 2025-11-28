@@ -78,6 +78,15 @@ export class WidgetMessageDto {
   component?: string;
 
   @ApiProperty({
+    description: 'Nome/ID do componente (usado para file_upload)',
+    example: 'upload_fd1a25ca-0e4c-4418-ba71-d60cdf316263',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  name?: string;
+
+  @ApiProperty({
     description: 'Título para componentes',
     example: 'Selecione uma opção',
     required: false,
