@@ -636,9 +636,31 @@ export class BrokerWidgetService {
 
     // Estrutura watson dialog responseCore.output.generic
     if (responseCore?.output?.generic) {
+      this.logger.debug('Standardizing Watson response', {
+        genericCount: responseCore.output.generic.length,
+        firstMessageType: responseCore.output.generic[0]?.response_type,
+        hasForms: responseCore.output.generic.some(
+          (m: any) => m.response_type === 'forms',
+        ),
+      });
+
       let i = 0;
       while (i < responseCore.output.generic.length) {
         const message = responseCore.output.generic[i];
+
+        // Log detalhado para forms
+        if (message.response_type === 'forms') {
+          this.logger.debug('Found forms message', {
+            hasJsonSchema: !!message.json_schema,
+            hasUiSchema: !!message.ui_schema,
+            hasName: !!message.name,
+            jsonSchemaTitle: message.json_schema?.title,
+            propertiesCount: message.json_schema?.properties
+              ? Object.keys(message.json_schema.properties).length
+              : 0,
+          });
+        }
+
         const standardizedMessage = this.processMessageByType(
           message,
           i,
@@ -714,6 +736,8 @@ export class BrokerWidgetService {
         return this.processFileUploadMessage(message);
       case 'date':
         return this.processDateMessage(message);
+      case 'forms':
+        return this.processFormsMessage(message);
       case 'pause':
         return null;
       default:
@@ -943,6 +967,42 @@ export class BrokerWidgetService {
     };
   }
 
+  private processFormsMessage(message: any): any {
+    this.logger.debug('Processing forms message', {
+      hasJsonSchema: !!message.json_schema,
+      hasUiSchema: !!message.ui_schema,
+      hasFormData: !!message.form_data,
+      hasName: !!message.name,
+      jsonSchemaKeys: message.json_schema
+        ? Object.keys(message.json_schema)
+        : [],
+      uiSchemaKeys: message.ui_schema ? Object.keys(message.ui_schema) : [],
+    });
+
+    // Garantir que temos os dados necessários
+    if (!message.json_schema || !message.ui_schema) {
+      this.logger.warn('Forms message missing required data', {
+        message: JSON.stringify(message).substring(0, 500),
+      });
+      return null;
+    }
+
+    return {
+      sender: 'ai',
+      message:
+        message.json_schema?.title || 'Por favor, preencha o formulário.',
+      component: 'forms',
+      form: {
+        name: message.name || 'form',
+        json_schema: message.json_schema,
+        ui_schema: message.ui_schema,
+        form_data: message.form_data || {},
+      },
+      messageId: randomUUID(),
+      timestamp: new Date().toISOString(),
+    };
+  }
+
   private processText(output: any, context: any): any {
     // Simplificado: reutilizando lógica similar se necessário, ou retornando simples
     return {
@@ -1021,6 +1081,18 @@ export class BrokerWidgetService {
 
   private sanitizeTextForWatson(text: string): string {
     if (!text) return '';
+
+    // Verificar se é um JSON de formulário (não sanitizar para preservar estrutura)
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed.form_name && parsed.form_data) {
+        // É um formulário, retornar como está (já está stringificado)
+        return text;
+      }
+    } catch {
+      // Não é JSON válido, continuar com sanitização
+    }
+
     return text
       .replace(/\t/g, ' ')
       .replace(/\r\n/g, ' ')

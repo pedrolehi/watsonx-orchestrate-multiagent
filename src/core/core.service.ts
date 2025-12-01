@@ -24,6 +24,19 @@ export class CoreService {
     return this.sessionThreadMap.has(sessionId);
   }
 
+  /**
+   * Verifica se o texto contém um formulário JSON
+   */
+  private isFormSubmission(text: string): boolean {
+    if (!text) return false;
+    try {
+      const parsed = JSON.parse(text);
+      return !!(parsed.form_name && parsed.form_data);
+    } catch {
+      return false;
+    }
+  }
+
   async run(
     payload: CoreRunDto,
     assistant: any, // Removido tipo Assistant estrito
@@ -109,6 +122,11 @@ export class CoreService {
           );
         }
 
+        // Verificar se o texto contém um formulário JSON
+        // Se sim, enviar o texto junto com os arquivos
+        const messageText = payload.message.text || '';
+        const isFormSubmission = this.isFormSubmission(messageText);
+
         // Enviar mensagem apenas com arquivos que foram uploadados com sucesso
         wxResponse = await this.watsonxService.sendMessageWithFiles(
           agentId,
@@ -116,6 +134,7 @@ export class CoreService {
           successfulUploads,
           uploadFieldId,
           payload.context,
+          isFormSubmission ? messageText : undefined, // Enviar texto se for formulário
         );
       } else {
         // Fluxo normal sem arquivos

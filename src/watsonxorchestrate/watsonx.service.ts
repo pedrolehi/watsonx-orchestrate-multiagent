@@ -461,6 +461,7 @@ export class WatsonxService {
     }>,
     uploadFieldId: string,
     baseContext?: any,
+    messageContent?: string, // Conteúdo opcional da mensagem (ex: JSON do formulário)
   ): Promise<any> {
     try {
       this.logger.log('Sending message with files', {
@@ -485,7 +486,7 @@ export class WatsonxService {
       const payload: any = {
         message: {
           role: 'user',
-          content: '', // Conteúdo vazio quando enviando arquivos
+          content: messageContent || '', // Usar conteúdo fornecido ou vazio
         },
         additional_properties: {},
         agent_id: agentId,
