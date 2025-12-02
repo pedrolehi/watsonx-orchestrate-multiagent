@@ -18,6 +18,7 @@ import {
   ApiOperation,
   ApiResponse,
   ApiTags,
+  ApiProduces,
 } from '@nestjs/swagger';
 import { memoryStorage } from 'multer';
 import multer from 'multer';
@@ -26,6 +27,11 @@ import { promisify } from 'util';
 import { AuthService } from '../auth/auth.service';
 import { BrokerWidgetService } from './broker-widget/broker-widget.service';
 import { WidgetAuthDto } from './dto/widget-auth.dto';
+import { TextToSpeechService } from '../watsonxorchestrate/text-to-speech.service';
+import { SpeechToTextService } from '../watsonxorchestrate/speech-to-text.service';
+import { AudioCacheService } from '../watsonxorchestrate/audio-cache.service';
+import { TextToSpeechDto } from './dto/text-to-speech.dto';
+import { SpeechToTextDto } from './dto/speech-to-text.dto';
 
 // Interceptor para processar FormData manualmente para streaming
 class FormDataStreamInterceptor implements NestInterceptor {
@@ -55,6 +61,9 @@ export class BrokerController {
   constructor(
     private readonly brokerWidgetService: BrokerWidgetService,
     private readonly authService: AuthService,
+    private readonly textToSpeechService: TextToSpeechService,
+    private readonly speechToTextService: SpeechToTextService,
+    private readonly audioCacheService: AudioCacheService,
   ) {}
 
   @Post('widget-auth')
@@ -154,5 +163,128 @@ export class BrokerController {
         res.end();
       },
     });
+  }
+
+  @Post('text-to-speech')
+  @ApiOperation({ summary: 'Sintetizar texto em áudio' })
+  @ApiResponse({
+    status: 200,
+    description: 'Áudio gerado com sucesso',
+    content: {
+      'audio/wav': {
+        schema: {
+          type: 'string',
+          format: 'binary',
+        },
+      },
+    },
+  })
+  @ApiProduces('audio/wav')
+  @ApiBody({ type: TextToSpeechDto })
+  async textToSpeech(
+    @Body() body: TextToSpeechDto,
+    @Res() res: Response,
+  ): Promise<void> {
+    try {
+      const { text, voice } = body;
+
+      // Verificar cache primeiro
+      const cached = this.audioCacheService.get(text, voice || '');
+      if (cached) {
+        res.setHeader('Content-Type', cached.contentType);
+        res.setHeader('Content-Length', cached.audio.length.toString());
+        res.setHeader('X-Cache', 'HIT');
+        res.send(cached.audio);
+        return;
+      }
+
+      // Gerar áudio
+      const result = await this.textToSpeechService.synthesize(text, voice);
+
+      // Armazenar no cache
+      this.audioCacheService.set(
+        text,
+        voice || '',
+        result.audio,
+        result.contentType,
+      );
+
+      // Retornar áudio
+      res.setHeader('Content-Type', result.contentType);
+      res.setHeader('Content-Length', result.audio.length.toString());
+      res.setHeader('X-Cache', 'MISS');
+      res.send(result.audio);
+    } catch (error) {
+      res.status(500).json({
+        error: 'Erro ao sintetizar texto',
+        message: error.message,
+      });
+    }
+  }
+
+  @Post('speech-to-text')
+  @UseInterceptors(
+    FilesInterceptor('audio', 1, {
+      storage: memoryStorage(),
+      limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+    }),
+  )
+  @ApiOperation({ summary: 'Transcrever áudio em texto' })
+  @ApiResponse({
+    status: 200,
+    description: 'Texto transcrito com sucesso',
+    schema: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          example: 'Texto transcrito do áudio',
+        },
+      },
+    },
+  })
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        audio: {
+          type: 'string',
+          format: 'binary',
+        },
+        contentType: {
+          type: 'string',
+          enum: [
+            'audio/wav',
+            'audio/flac',
+            'audio/ogg',
+            'audio/ogg;codecs=opus',
+          ],
+          example: 'audio/wav',
+        },
+      },
+    },
+  })
+  async speechToText(
+    @Req() req: any,
+    @Body() body: SpeechToTextDto,
+    @UploadedFiles() files?: Array<Express.Multer.File>,
+  ): Promise<{ text: string }> {
+    const audioFile = files && files.length > 0 ? files[0] : req.file;
+
+    if (!audioFile) {
+      throw new Error('Arquivo de áudio não encontrado');
+    }
+
+    const contentType = body.contentType || audioFile.mimetype || 'audio/wav';
+
+    const audioBuffer = audioFile.buffer;
+
+    const text = await this.speechToTextService.recognize(
+      audioBuffer,
+      contentType,
+    );
+
+    return { text };
   }
 }

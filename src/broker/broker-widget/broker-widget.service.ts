@@ -6,6 +6,7 @@ import { AuthService } from '../../auth/auth.service';
 import { CoreService } from '../../core/core.service';
 import { CoreRunDto } from '../../core/dto/core.dto';
 import { StatusEvent } from '../../watsonxorchestrate/tool-status.constants';
+import { SpeechToTextService } from '../../watsonxorchestrate/speech-to-text.service';
 import { WidgetAuthDto } from '../dto/widget-auth.dto';
 import {
   WidgetContextDto,
@@ -30,6 +31,7 @@ export class BrokerWidgetService {
   constructor(
     private readonly coreService: CoreService,
     private readonly authService: AuthService,
+    private readonly speechToTextService: SpeechToTextService,
   ) {}
 
   /**
@@ -218,12 +220,46 @@ export class BrokerWidgetService {
       settings: {} as WidgetSettingsDto,
     };
 
+    // Transcrever áudio se houver arquivo de áudio
+    let transcribedText: string | null = null;
+    if (hasFiles && files) {
+      const audioFile = files.find(
+        (file) =>
+          file.mimetype?.startsWith('audio/') ||
+          file.originalname?.match(/\.(wav|webm|ogg|flac|mp3|m4a)$/i),
+      );
+
+      if (audioFile) {
+        try {
+          this.logger.log('Transcrevendo áudio enviado pelo usuário');
+          transcribedText = await this.speechToTextService.recognize(
+            audioFile.buffer,
+            audioFile.mimetype || 'audio/webm',
+          );
+          this.logger.log('Áudio transcrito com sucesso', {
+            textLength: transcribedText.length,
+          });
+        } catch (error) {
+          this.logger.warn('Erro ao transcrever áudio', {
+            error: error.message,
+          });
+          // Continuar mesmo se a transcrição falhar
+        }
+      }
+    }
+
     // Padronizar a resposta do Watson independente da estrutura
     const standardizedData = this.standardizeWatsonResponse(
       coreResponse.response,
       coreResponse.context,
     );
     response.messages = standardizedData.messages;
+
+    // Adicionar texto transcrito à primeira mensagem de resposta se houver
+    if (transcribedText && response.messages.length > 0) {
+      // Adicionar transcrição como metadado na primeira mensagem
+      response.messages[0].transcribedText = transcribedText;
+    }
     // const cleanedVariablesForDB = standardizedData.updatedVariables; // Usado para persistência, ignorado aqui por enquanto
 
     if (

@@ -138,6 +138,15 @@ export class WidgetMessageDto {
   @IsOptional()
   @IsString()
   filename?: string;
+
+  @ApiProperty({
+    description: 'Texto transcrito de mensagem de áudio',
+    example: 'Olá, preciso de ajuda',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  transcribedText?: string;
 }
 
 export class WidgetContextDto {
