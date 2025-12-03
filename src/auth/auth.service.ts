@@ -315,10 +315,41 @@ export class AuthService {
     } catch (error) {
       this.logger.error(`❌ Erro ao identificar funcionário: ${error.message}`);
 
+      // Tratamento específico para diferentes códigos de status HTTP
       if (error.response?.status === 501) {
         return {
           success: false,
           error: error.response.data?.MENSAGEM || 'Token inválido',
+        };
+      }
+
+      if (error.response?.status === 503) {
+        this.logger.warn(
+          '⚠️ Serviço de autenticação temporariamente indisponível (503)',
+        );
+        return {
+          success: false,
+          error:
+            'Serviço de autenticação temporariamente indisponível. Tente novamente em alguns instantes.',
+        };
+      }
+
+      if (error.response?.status === 500) {
+        this.logger.warn('⚠️ Erro interno no servidor de autenticação (500)');
+        return {
+          success: false,
+          error:
+            'Erro interno no servidor de autenticação. Tente novamente mais tarde.',
+        };
+      }
+
+      // Timeout ou erro de conexão
+      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+        this.logger.warn('⚠️ Timeout na requisição de autenticação');
+        return {
+          success: false,
+          error:
+            'Tempo de espera esgotado. O serviço pode estar sobrecarregado. Tente novamente.',
         };
       }
 

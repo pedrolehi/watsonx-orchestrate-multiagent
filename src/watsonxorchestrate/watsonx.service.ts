@@ -157,6 +157,55 @@ export class WatsonxService {
     return processed;
   }
 
+  /**
+   * Formata a resposta do saldo de horas em markdown
+   */
+  private formatSaldoHorasResponse(
+    saldoAnterior: string | null | undefined,
+    saldoAtual: string | null | undefined,
+  ): string {
+    const parts: string[] = [];
+
+    parts.push('## Relatório de Saldo de Banco de Horas\n');
+
+    // Saldo anterior (mês fechado)
+    if (saldoAnterior !== undefined && saldoAnterior !== null) {
+      parts.push(
+        `**Saldo do banco de horas até outubro (mês fechado):** **${saldoAnterior}**\n`,
+      );
+    }
+
+    parts.push('\n---\n\n');
+
+    // Prévia do mês atual
+    parts.push('### Prévia do Mês Atual\n');
+    if (saldoAtual !== undefined && saldoAtual !== null) {
+      if (saldoAtual.toLowerCase().includes('não apurado')) {
+        parts.push(
+          `**Prévia do banco de horas do mês de novembro:** Ponto não apurado\n`,
+        );
+      } else {
+        parts.push(
+          `**Prévia do banco de horas do mês de novembro:** ${saldoAtual}\n`,
+        );
+      }
+    } else {
+      parts.push(
+        '**Prévia do banco de horas do mês de novembro:** Ponto não apurado\n',
+      );
+    }
+
+    parts.push('\n---\n\n');
+
+    // Aviso
+    parts.push('### Atenção\n');
+    parts.push(
+      '> **Atenção:** O saldo de banco de horas é referente ao ponto do **mês fechado** e poderá ser ajustado conforme correções solicitadas pelo setor administrativo.\n',
+    );
+
+    return parts.join('');
+  }
+
   private async getIamToken(): Promise<string> {
     const now = Date.now() / 1000;
     if (this.iamToken && now < this.tokenExpiration) {
@@ -251,6 +300,9 @@ export class WatsonxService {
     '.tif',
     '.txt',
     '.wav',
+    '.webm',
+    '.ogg',
+    '.flac',
     '.xls',
     '.xlsx',
   ];
@@ -268,6 +320,9 @@ export class WatsonxService {
     'text/plain',
     'audio/wav',
     'audio/wave',
+    'audio/webm',
+    'audio/ogg',
+    'audio/flac',
     'application/vnd.ms-excel',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   ];
@@ -293,11 +348,31 @@ export class WatsonxService {
 
     // Validar extensão
     const extension = fileName.toLowerCase().slice(fileName.lastIndexOf('.'));
-    if (!this.SUPPORTED_FILE_EXTENSIONS.includes(extension)) {
-      return {
-        valid: false,
-        error: `Tipo de arquivo não suportado: ${extension}. Tipos suportados: CSV, DOC, DOCX, JPEG, PDF, PNG, PPT, PPTX, TIFF, TXT, WAV, XLS, XLSX`,
-      };
+    const hasValidExtension =
+      this.SUPPORTED_FILE_EXTENSIONS.includes(extension);
+
+    // Se não tem extensão válida, verificar se é arquivo de áudio pelo MIME type
+    // (permite arquivos de áudio sem extensão, como "blob" do MediaRecorder)
+    if (!hasValidExtension) {
+      const isAudioByMimeType =
+        mimeType &&
+        mimeType.startsWith('audio/') &&
+        this.SUPPORTED_MIME_TYPES.includes(mimeType);
+
+      if (!isAudioByMimeType) {
+        return {
+          valid: false,
+          error: `Tipo de arquivo não suportado: ${extension || 'sem extensão'}. Tipos suportados: CSV, DOC, DOCX, JPEG, PDF, PNG, PPT, PPTX, TIFF, TXT, WAV, WEBM, OGG, FLAC, XLS, XLSX`,
+        };
+      }
+      // Se é áudio válido pelo MIME type, permitir mesmo sem extensão
+      this.logger.warn(
+        'Arquivo de áudio sem extensão válida, aceito pelo MIME type',
+        {
+          fileName,
+          mimeType,
+        },
+      );
     }
 
     // Validar MIME type se fornecido
@@ -565,11 +640,21 @@ export class WatsonxService {
         payload.thread_id = threadId;
       }
 
-      this.logger.debug('[sendMessageStream]', {
-        agentId,
-        threadId: threadId || 'new (first message)',
-        payload: JSON.stringify(payload),
-      });
+      // Log detalhado do payload sendo enviado ao Watson Orchestrate
+      this.logger.log(
+        '[sendMessageStream] Payload enviado ao Watson Orchestrate',
+        {
+          agentId,
+          threadId: threadId || 'new (first message)',
+          payload: JSON.stringify(payload, null, 2),
+          contextKeys: context ? Object.keys(context) : [],
+          hasUserInfo: !!context?.user_info,
+          hasUserSummary: !!context?.user_summary,
+          userSummaryChapa: context?.user_summary?.chapa,
+          userInfoChapa:
+            context?.user_info?.CHAPA || context?.user_info?.DADOS?.CHAPA,
+        },
+      );
 
       const response = await this.axiosInstance.post('/runs', payload, {
         params: {
@@ -1932,6 +2017,106 @@ export class WatsonxService {
           isAsyncTool,
           ...debugInfo,
         };
+
+        // Interceptar e melhorar resposta do flow de saldo de horas
+        try {
+          const flowInstanceId =
+            debugInfo.flowInstanceId ||
+            messageCreated?.response_metadata?.flowinstance_id;
+
+          if (flowInstanceId) {
+            const flowInstance = await this.getFlowInstances({
+              instance_id: flowInstanceId,
+            });
+
+            if (flowInstance) {
+              const instance = Array.isArray(flowInstance)
+                ? flowInstance[0]
+                : flowInstance;
+
+              // Verificar se é o flow de saldo de horas
+              if (
+                instance.name === 'GEP_FLOW_consulta_saldo_horas' &&
+                instance.state === 'completed' &&
+                instance.tasks
+              ) {
+                this.logger.log('Flow de saldo de horas detectado', {
+                  flowInstanceId,
+                  flowName: instance.name,
+                  state: instance.state,
+                  tasksCount: instance.tasks.length,
+                });
+
+                const saldoHorasTask = instance.tasks.find(
+                  (task: any) => task.name === 'get_saldo_horas',
+                );
+
+                if (!saldoHorasTask) {
+                  this.logger.warn('Task get_saldo_horas não encontrada', {
+                    availableTasks: instance.tasks.map((t: any) => t.name),
+                  });
+                }
+
+                if (saldoHorasTask?.output?.data) {
+                  const outputData = saldoHorasTask.output.data;
+                  let saldoInfo: any = null;
+
+                  // Tentar parsear o outputData se for string
+                  if (typeof outputData === 'string') {
+                    try {
+                      saldoInfo = JSON.parse(outputData);
+                    } catch {
+                      // Se não conseguir parsear, tentar usar como está
+                      this.logger.warn(
+                        'Could not parse saldo horas outputData as JSON',
+                        { outputData: outputData.substring(0, 200) },
+                      );
+                    }
+                  } else {
+                    saldoInfo = outputData;
+                  }
+
+                  // Extrair dados do info se existir
+                  // O output pode ter a estrutura: {error: null, info: {...}, status: 200}
+                  // ou diretamente: {saldo_anterior: "...", saldo_atual: "..."}
+                  const info = saldoInfo?.info || saldoInfo;
+                  const saldoAnterior =
+                    info?.saldo_anterior || saldoInfo?.saldo_anterior;
+                  const saldoAtual =
+                    info?.saldo_atual || saldoInfo?.saldo_atual;
+
+                  if (saldoAnterior !== undefined || saldoAtual !== undefined) {
+                    // Construir resposta formatada em markdown
+                    const formattedResponse = this.formatSaldoHorasResponse(
+                      saldoAnterior,
+                      saldoAtual,
+                    );
+
+                    // Substituir a resposta ruim pela formatada
+                    response.output.generic = [
+                      {
+                        response_type: 'text',
+                        text: formattedResponse,
+                      },
+                    ];
+
+                    this.logger.log('Saldo de horas response improved', {
+                      flowInstanceId,
+                      saldoAnterior,
+                      saldoAtual,
+                    });
+                  }
+                }
+              }
+            }
+          }
+        } catch (improveError: any) {
+          // Não bloquear a resposta se houver erro ao melhorar
+          this.logger.warn(
+            'Error improving saldo horas response',
+            improveError.message,
+          );
+        }
 
         this.logger.log('Returning response', {
           hasOutput: !!response.output,

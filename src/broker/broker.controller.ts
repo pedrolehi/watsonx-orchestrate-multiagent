@@ -9,6 +9,7 @@ import {
   CallHandler,
   NestInterceptor,
   ExecutionContext,
+  Logger,
 } from '@nestjs/common';
 import { Response } from 'express';
 import { FilesInterceptor } from '@nestjs/platform-express';
@@ -27,9 +28,9 @@ import { promisify } from 'util';
 import { AuthService } from '../auth/auth.service';
 import { BrokerWidgetService } from './broker-widget/broker-widget.service';
 import { WidgetAuthDto } from './dto/widget-auth.dto';
-import { TextToSpeechService } from '../watsonxorchestrate/text-to-speech.service';
-import { SpeechToTextService } from '../watsonxorchestrate/speech-to-text.service';
-import { AudioCacheService } from '../watsonxorchestrate/audio-cache.service';
+import { TextToSpeechService } from '../audio/text-to-speech/text-to-speech.service';
+import { SpeechToTextService } from '../audio/speech-to-text/speech-to-text.service';
+import { AudioCacheService } from '../audio/audio-cache/audio-cache.service';
 import { TextToSpeechDto } from './dto/text-to-speech.dto';
 import { SpeechToTextDto } from './dto/speech-to-text.dto';
 
@@ -58,6 +59,8 @@ class FormDataStreamInterceptor implements NestInterceptor {
 @Controller('broker')
 @ApiTags('Broker')
 export class BrokerController {
+  private readonly logger = new Logger(BrokerController.name);
+
   constructor(
     private readonly brokerWidgetService: BrokerWidgetService,
     private readonly authService: AuthService,
@@ -94,14 +97,30 @@ export class BrokerController {
     @Body() body: any,
     @UploadedFiles() files?: Array<Express.Multer.File>,
   ) {
-    const formData = req.body || body;
+    try {
+      const formData = req.body || body;
 
-    if (!formData?.message) {
-      throw new Error('Mensagem não encontrada no corpo da requisição');
+      if (!formData?.message) {
+        throw new Error('Mensagem não encontrada no corpo da requisição');
+      }
+
+      let messageData;
+      try {
+        messageData = JSON.parse(formData.message);
+      } catch (parseError) {
+        throw new Error(
+          `Erro ao fazer parse da mensagem: ${parseError.message}`,
+        );
+      }
+
+      return await this.brokerWidgetService.run(messageData, files);
+    } catch (error) {
+      this.logger.error('Erro no endpoint widget-conversation', {
+        error: error.message,
+        stack: error.stack,
+      });
+      throw error;
     }
-
-    const messageData = JSON.parse(formData.message);
-    return this.brokerWidgetService.run(messageData, files);
   }
 
   // Endpoint para streaming (SSE)
@@ -120,6 +139,20 @@ export class BrokerController {
   ): Promise<void> {
     const files = (req.files as Array<Express.Multer.File>) || undefined;
     const formData = req.body || body;
+
+    // Log detalhado dos arquivos recebidos
+    console.log('[BrokerController] widgetStream - Arquivos recebidos:', {
+      hasFiles: !!files,
+      filesCount: files?.length || 0,
+      files: files?.map((f) => ({
+        fieldname: f.fieldname,
+        originalname: f.originalname,
+        encoding: f.encoding,
+        mimetype: f.mimetype,
+        size: f.size,
+        bufferLength: f.buffer?.length || 0,
+      })),
+    });
 
     if (!formData?.message) {
       res

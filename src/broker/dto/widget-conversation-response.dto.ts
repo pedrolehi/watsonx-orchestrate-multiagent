@@ -308,6 +308,15 @@ export class WidgetConversationResponseDto {
   success: boolean;
 
   @ApiProperty({
+    description: 'Texto transcrito de mensagem de áudio do usuário',
+    example: 'Olá, preciso de ajuda',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  transcribedText?: string;
+
+  @ApiProperty({
     description: 'Lista de mensagens padronizadas para o widget',
     type: [WidgetMessageDto],
     required: true,

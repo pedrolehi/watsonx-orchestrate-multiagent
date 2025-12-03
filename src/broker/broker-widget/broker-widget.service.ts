@@ -6,7 +6,7 @@ import { AuthService } from '../../auth/auth.service';
 import { CoreService } from '../../core/core.service';
 import { CoreRunDto } from '../../core/dto/core.dto';
 import { StatusEvent } from '../../watsonxorchestrate/tool-status.constants';
-import { SpeechToTextService } from '../../watsonxorchestrate/speech-to-text.service';
+import { SpeechToTextService } from '../../audio/speech-to-text/speech-to-text.service';
 import { WidgetAuthDto } from '../dto/widget-auth.dto';
 import {
   WidgetContextDto,
@@ -28,11 +28,108 @@ export interface WidgetSSEEvent {
 export class BrokerWidgetService {
   private readonly logger = new Logger(BrokerWidgetService.name);
 
+  // Cache em memória para dados de autenticação por sessionId
+  // Formato: Map<sessionId, { userData, acessoRelatorios, timestamp }>
+  private readonly userAuthCache = new Map<
+    string,
+    {
+      userData: any;
+      acessoRelatorios?: any;
+      timestamp: number;
+    }
+  >();
+
+  // TTL do cache: 1 hora (3600000 ms)
+  private readonly CACHE_TTL = 3600000;
+
   constructor(
     private readonly coreService: CoreService,
     private readonly authService: AuthService,
     private readonly speechToTextService: SpeechToTextService,
   ) {}
+
+  /**
+   * Obtém dados do usuário do cache ou autentica se necessário
+   */
+  private async getUserData(
+    sessionId: string,
+    chapa?: string,
+    emplid?: string,
+  ): Promise<
+    { userData: any; acessoRelatorios?: any } | { error: string } | null
+  > {
+    // Verificar cache primeiro
+    const cached = this.userAuthCache.get(sessionId);
+    if (cached) {
+      const age = Date.now() - cached.timestamp;
+      if (age < this.CACHE_TTL) {
+        this.logger.debug('Usando dados do usuário do cache', {
+          sessionId,
+          cacheAge: `${Math.round(age / 1000)}s`,
+        });
+        return {
+          userData: cached.userData,
+          acessoRelatorios: cached.acessoRelatorios,
+        };
+      } else {
+        // Cache expirado, remover
+        this.userAuthCache.delete(sessionId);
+        this.logger.debug('Cache expirado, removendo', { sessionId });
+      }
+    }
+
+    // Cache não encontrado ou expirado, autenticar
+    if (!chapa && (!emplid || emplid === '0000000')) {
+      return null;
+    }
+
+    let userData: any = null;
+    let acessoRelatorios: any = null;
+
+    if (chapa) {
+      this.logger.log('Autenticando funcionário por CHAPA', {
+        chapa,
+        sessionId,
+      });
+      const authResult = await this.authService.identifyEmployee(chapa);
+      if (authResult.success) {
+        userData = authResult.data;
+        acessoRelatorios = authResult.acessoRelatorios;
+        this.logger.log('Funcionário autenticado com sucesso');
+      } else {
+        this.logger.warn('Falha na autenticação do funcionário', {
+          chapa,
+          error: authResult.error,
+        });
+        return { error: authResult.error || 'Erro ao autenticar funcionário' };
+      }
+    } else if (emplid && emplid !== '0000000') {
+      this.logger.log('Autenticando aluno por EMPLID', { emplid, sessionId });
+      const authResult = await this.authService.identifyStudent(emplid);
+      if (authResult.success) {
+        userData = authResult.data;
+        this.logger.log('Aluno autenticado com sucesso');
+      } else {
+        this.logger.warn('Falha na autenticação do aluno', {
+          emplid,
+          error: authResult.error,
+        });
+        return { error: authResult.error || 'Erro ao autenticar aluno' };
+      }
+    }
+
+    // Armazenar no cache se autenticação foi bem-sucedida
+    if (userData) {
+      this.userAuthCache.set(sessionId, {
+        userData,
+        acessoRelatorios,
+        timestamp: Date.now(),
+      });
+      this.logger.debug('Dados do usuário armazenados no cache', { sessionId });
+    }
+
+    return userData ? { userData, acessoRelatorios } : null;
+  }
 
   /**
    * Retorna saudação baseada na hora atual
@@ -78,249 +175,348 @@ export class BrokerWidgetService {
     data: WidgetConversationDto,
     files?: Array<Express.Multer.File>,
   ): Promise<WidgetConversationResponseDto> {
-    this.logger.log('User message', {
-      sessionId: data.sessionId,
-      text: data.text?.substring(0, 50) + (data.text?.length > 50 ? '...' : ''),
-    });
+    try {
+      this.logger.log('User message', {
+        sessionId: data.sessionId,
+        text:
+          data.text?.substring(0, 50) + (data.text?.length > 50 ? '...' : ''),
+      });
 
-    // Nota: A validação do assistente e persistência de conversa foram movidas/removidas
-    // conforme a reestruturação para focar apenas no novo CoreModule Watsonx.
+      // Nota: A validação do assistente e persistência de conversa foram movidas/removidas
+      // conforme a reestruturação para focar apenas no novo CoreModule Watsonx.
 
-    const hasFiles = !!files && files.length > 0;
+      const hasFiles = !!files && files.length > 0;
 
-    // Verificar se é a primeira mensagem baseado no mapeamento interno do CoreService
-    // O backend controla o thread_id, não o widget
-    const isFirstMessage = !this.coreService.hasExistingThread(data.sessionId);
-
-    // Extrair apenas os valores essenciais para o contexto do agent
-    const emplid = data.user?.emplid || data.user?.context?.emplid;
-    const chapa = data.user?.chapa || data.user?.context?.chapa;
-    // assistantId é o UUID do agent no Watson Orchestrate
-    const agentId = data.assistantId;
-
-    // Saudação: usar do widget (hora local do usuário) ou calcular no servidor como fallback
-    const greeting =
-      data.user?.greeting ||
-      data.user?.context?.greeting ||
-      this.getGreetingByTime();
-
-    // ===== AUTENTICAÇÃO AUTOMÁTICA NA PRIMEIRA MENSAGEM =====
-    // Autentica o usuário ANTES de enviar para a LLM, eliminando a necessidade
-    // da LLM chamar tools de autenticação e melhorando a performance.
-    let userData: any = null;
-    let acessoRelatorios: any = null;
-    let authError: string | null = null;
-
-    if (isFirstMessage) {
-      if (chapa) {
-        // Funcionário: autenticar por CHAPA
-        this.logger.log('Autenticando funcionário por CHAPA', { chapa });
-        const authResult = await this.authService.identifyEmployee(chapa);
-        if (authResult.success) {
-          userData = authResult.data;
-          acessoRelatorios = authResult.acessoRelatorios;
-          this.logger.log('Funcionário autenticado com sucesso');
-        } else {
-          authError = authResult.error || null;
-          this.logger.warn('Falha na autenticação do funcionário', {
-            error: authError,
-          });
-        }
-      } else if (emplid && emplid !== '0000000') {
-        // Aluno: autenticar por EMPLID (ignorar emplid placeholder "0000000")
-        this.logger.log('Autenticando aluno por EMPLID', { emplid });
-        const authResult = await this.authService.identifyStudent(emplid);
-        if (authResult.success) {
-          userData = authResult.data;
-          this.logger.log('Aluno autenticado com sucesso');
-        } else {
-          authError = authResult.error || null;
-          this.logger.warn('Falha na autenticação do aluno', {
-            error: authError,
-          });
-        }
-      } else {
-        // Nenhum identificador fornecido
-        authError =
-          'Nenhum identificador de usuário fornecido (chapa ou emplid)';
-        this.logger.warn('Tentativa de acesso sem identificador de usuário');
-      }
-
-      // ===== BLOQUEAR ACESSO SE AUTENTICAÇÃO FALHOU =====
-      if (!userData) {
-        const errorCode = this.generateErrorCode();
-        this.logger.error('Acesso negado: usuário não autenticado', {
-          authError,
-          errorCode,
-        });
-
-        const errorDetails = authError
-          ? `\n\n**Detalhes do erro:** ${authError}`
-          : '';
-
-        return {
-          success: false,
-          messages: [
-            {
-              sender: 'ai',
-              message:
-                '**Não foi possível autenticar o usuário.**\n\nVocê não tem permissão de acesso aos recursos do assistente virtual. Verifique se está logado corretamente ou entre em contato com o suporte.' +
-                errorDetails +
-                `\n\n**Código do erro:** \`${errorCode}\``,
-              messageId: `error_${Date.now()}`,
-              timestamp: new Date().toISOString(),
-              isError: true,
-            },
-          ],
-          settings: {},
-        };
-      }
-    }
-
-    // Construir user_info com dados do usuário autenticado
-    const userInfo: any = userData
-      ? {
-          ...userData,
-          ...(acessoRelatorios && { acessoRelatorios }),
-        }
-      : null;
-
-    const payload: CoreRunDto = {
-      message: {
-        type: 'text',
-        text: this.sanitizeTextForWatson(data.text || ''),
-      },
-      conversationId: data.sessionId,
-      profileName: 'Widget User',
-      context: {
-        // agent_id é o UUID do agent no Watson Orchestrate (enviado pelo widget como assistantId)
-        ...(agentId && { agent_id: agentId }),
-        // Dados do usuário autenticado dentro de user_info
-        ...(userInfo && { user_info: userInfo }),
-        // IMPORTANTE: is_first_message é determinado pelo backend via CoreService.hasExistingThread
-        is_first_message: isFirstMessage,
-        // Session ID para referência
-        session_id: data.sessionId,
-        // Saudação baseada na hora local do usuário (Bom dia, Boa tarde, Boa noite)
-        greeting: greeting,
-      },
-      channel: 'widget',
-    };
-
-    // Chamada direta ao CoreService novo
-    const coreResponse = await this.coreService.run(
-      payload,
-      null, // Assistant entity removida
-      files,
-    );
-
-    let response: WidgetConversationResponseDto = {
-      success: true,
-      messages: [],
-      settings: {} as WidgetSettingsDto,
-    };
-
-    // Transcrever áudio se houver arquivo de áudio
-    let transcribedText: string | null = null;
-    if (hasFiles && files) {
-      const audioFile = files.find(
-        (file) =>
-          file.mimetype?.startsWith('audio/') ||
-          file.originalname?.match(/\.(wav|webm|ogg|flac|mp3|m4a)$/i),
+      // Verificar se é a primeira mensagem baseado no mapeamento interno do CoreService
+      // O backend controla o thread_id, não o widget
+      const isFirstMessage = !this.coreService.hasExistingThread(
+        data.sessionId,
       );
 
-      if (audioFile) {
-        try {
-          this.logger.log('Transcrevendo áudio enviado pelo usuário');
-          transcribedText = await this.speechToTextService.recognize(
-            audioFile.buffer,
-            audioFile.mimetype || 'audio/webm',
-          );
-          this.logger.log('Áudio transcrito com sucesso', {
-            textLength: transcribedText.length,
-          });
-        } catch (error) {
-          this.logger.warn('Erro ao transcrever áudio', {
-            error: error.message,
-          });
-          // Continuar mesmo se a transcrição falhar
+      // Extrair apenas os valores essenciais para o contexto do agent
+      const emplid = data.user?.emplid || data.user?.context?.emplid;
+      const chapa = data.user?.chapa || data.user?.context?.chapa;
+      // assistantId é o UUID do agent no Watson Orchestrate
+      const agentId = data.assistantId;
+
+      // Saudação: usar do widget (hora local do usuário) ou calcular no servidor como fallback
+      // SEMPRE calcular para garantir que esteja disponível no contexto
+      const greeting =
+        data.user?.greeting ||
+        data.user?.context?.greeting ||
+        this.getGreetingByTime();
+
+      // Garantir que greeting sempre seja uma string válida
+      const finalGreeting = greeting || this.getGreetingByTime();
+
+      // ===== AUTENTICAÇÃO AUTOMÁTICA (com cache) =====
+      // Obtém dados do usuário do cache ou autentica se necessário
+      // Nas mensagens subsequentes, reutiliza os dados já autenticados
+      const authResult = await this.getUserData(data.sessionId, chapa, emplid);
+      let userData: any = null;
+      let acessoRelatorios: any = null;
+      let authError: string | null = null;
+
+      if (authResult) {
+        // Verificar se é um erro
+        if ('error' in authResult) {
+          authError = authResult.error;
+        } else {
+          userData = authResult.userData;
+          acessoRelatorios = authResult.acessoRelatorios;
         }
       }
-    }
 
-    // Padronizar a resposta do Watson independente da estrutura
-    const standardizedData = this.standardizeWatsonResponse(
-      coreResponse.response,
-      coreResponse.context,
-    );
-    response.messages = standardizedData.messages;
+      // Se não conseguiu autenticar, bloquear acesso na primeira mensagem
+      if (!userData) {
+        if (isFirstMessage) {
+          authError =
+            authError ||
+            'Nenhum identificador de usuário fornecido ou falha na autenticação';
+          const errorCode = this.generateErrorCode();
+          this.logger.error('Acesso negado: usuário não autenticado', {
+            authError,
+            errorCode,
+          });
 
-    // Adicionar texto transcrito à primeira mensagem de resposta se houver
-    if (transcribedText && response.messages.length > 0) {
-      // Adicionar transcrição como metadado na primeira mensagem
-      response.messages[0].transcribedText = transcribedText;
-    }
-    // const cleanedVariablesForDB = standardizedData.updatedVariables; // Usado para persistência, ignorado aqui por enquanto
+          // Se for erro de serviço indisponível, mostrar apenas a mensagem do erro
+          // Caso contrário, mostrar mensagem genérica + detalhes
+          const isServiceUnavailable =
+            authError && authError.includes('temporariamente indisponível');
+          const errorMessage = isServiceUnavailable
+            ? authError
+            : 'Você não tem permissão de acesso aos recursos do assistente virtual. Verifique se está logado corretamente ou entre em contato com o suporte.';
+          const errorDetails =
+            !isServiceUnavailable && authError
+              ? `\n\n**Detalhes:** ${authError}`
+              : '';
 
-    if (
-      coreResponse.settings &&
-      Object.keys(coreResponse.settings).length > 0
-    ) {
-      response.settings = coreResponse.settings;
-    }
+          return {
+            success: false,
+            messages: [
+              {
+                sender: 'ai',
+                message:
+                  '**Não foi possível autenticar o usuário.**\n\n' +
+                  errorMessage +
+                  errorDetails +
+                  `\n\n**Código do erro:** \`${errorCode}\``,
+                messageId: `error_${Date.now()}`,
+                timestamp: new Date().toISOString(),
+                isError: true,
+              },
+            ],
+            settings: {},
+          };
+        }
+        // Nas mensagens subsequentes, apenas logar o aviso mas continuar
+        this.logger.warn(
+          'Dados do usuário não disponíveis no cache e não foi possível autenticar',
+          {
+            sessionId: data.sessionId,
+          },
+        );
+      }
 
-    // Verificar se há mensagem de file_upload para ativar botão de anexos
-    // O botão só aparece quando o agente pede um arquivo e desaparece após enviar
-    const fileUploadMessage = standardizedData.messages.find(
-      (msg) => msg.component === 'file_upload',
-    );
-    const hasFileUpload = !!fileUploadMessage;
-    response.settings = {
-      ...response.settings,
-      botaoAnexo: hasFileUpload, // true só quando agente pede arquivo, false caso contrário
-      // Passar o ID do campo de upload para o widget usar ao enviar arquivos
-      ...(hasFileUpload &&
-        fileUploadMessage?.name && {
-          uploadFieldId: fileUploadMessage.name,
-        }),
-    };
-    if (hasFileUpload) {
-      this.logger.log('File upload detected, enabling attachment button', {
-        uploadFieldId: fileUploadMessage?.name,
+      // Construir user_info com dados do usuário autenticado
+      const userInfo: any = userData
+        ? {
+            ...userData,
+            ...(acessoRelatorios && { acessoRelatorios }),
+          }
+        : null;
+
+      // Transcrever áudio ANTES de enviar para o Orchestrate
+      // Arquivos de áudio não são enviados para S3 nem para Orchestrate
+      // Apenas o texto transcrito é enviado como mensagem de texto
+      let transcribedText: string | null = null;
+      let audioFiles: Array<Express.Multer.File> = [];
+      let nonAudioFiles: Array<Express.Multer.File> = [];
+
+      this.logger.log('Verificando arquivos para transcrição', {
+        hasFiles,
+        filesCount: files?.length || 0,
+        files: files?.map((f) => ({
+          name: f.originalname,
+          mimetype: f.mimetype,
+          size: f.size,
+        })),
       });
-    }
 
-    // Adicionar contexto para debug no frontend
-    response.context = coreResponse.context as WidgetContextDto;
+      if (hasFiles && files) {
+        // Separar arquivos de áudio dos outros arquivos
+        audioFiles = files.filter(
+          (file) =>
+            file.mimetype?.startsWith('audio/') ||
+            file.originalname?.match(/\.(wav|webm|ogg|flac|mp3|m4a)$/i),
+        );
+        nonAudioFiles = files.filter(
+          (file) =>
+            !file.mimetype?.startsWith('audio/') &&
+            !file.originalname?.match(/\.(wav|webm|ogg|flac|mp3|m4a)$/i),
+        );
 
-    // Adicionar informações de debug do Watson (preservando lógica legada simplificada)
-    if (coreResponse.response?.output?.generic) {
-      const watsonResponse = coreResponse.response;
-      let nodesVisited: any[] = [];
-      let errors: any[] = [];
-      let logMessages: any[] = [];
+        // Transcrever o primeiro arquivo de áudio encontrado
+        if (audioFiles.length > 0) {
+          const audioFile = audioFiles[0];
+          try {
+            this.logger.log('Transcrevendo áudio enviado pelo usuário', {
+              fileName: audioFile.originalname,
+              mimetype: audioFile.mimetype,
+              bufferSize: audioFile.buffer.length,
+            });
 
-      watsonResponse.output.generic.forEach((msg: any) => {
-        if (msg.debug?.nodes_visited) nodesVisited = msg.debug.nodes_visited;
-        if (msg.debug?.errors) errors = msg.debug.errors;
-        if (msg.debug?.log_messages) logMessages = msg.debug.log_messages;
+            // O serviço de Speech-to-Text aceita apenas: audio/wav, audio/flac, audio/ogg, audio/ogg;codecs=opus
+            // WebM não é suportado e será rejeitado com erro claro
+            transcribedText = await this.speechToTextService.recognize(
+              audioFile.buffer,
+              audioFile.mimetype || 'audio/ogg',
+            );
+            this.logger.log('Áudio transcrito com sucesso', {
+              textLength: transcribedText.length,
+              transcribedText:
+                transcribedText.substring(0, 100) +
+                (transcribedText.length > 100 ? '...' : ''),
+            });
+          } catch (error) {
+            this.logger.error('Erro ao transcrever áudio', {
+              error: error.message,
+              stack: error.stack,
+            });
+            // Se a transcrição falhar, usar o texto original se houver
+            transcribedText = null;
+          }
+        } else {
+          this.logger.log(
+            'Nenhum arquivo de áudio encontrado para transcrição',
+          );
+        }
+      }
+
+      // Construir o texto da mensagem: usar texto transcrito se houver áudio, senão usar texto original
+      // Se for primeira mensagem e estiver vazia, enviar "oi" para iniciar a conversa
+      let messageText = transcribedText || data.text || '';
+      if (isFirstMessage && !messageText.trim()) {
+        messageText = 'oi';
+        this.logger.log(
+          'Primeira mensagem vazia, enviando "oi" automaticamente',
+        );
+      }
+
+      this.logger.log('Construindo payload com texto da mensagem', {
+        hasTranscribedText: !!transcribedText,
+        transcribedTextLength: transcribedText?.length || 0,
+        hasOriginalText: !!data.text,
+        originalTextLength: data.text?.length || 0,
+        finalMessageText:
+          messageText.substring(0, 100) +
+          (messageText.length > 100 ? '...' : ''),
+        finalMessageTextLength: messageText.length,
       });
 
-      response.debug = {
-        nodesVisited,
-        errors,
-        logMessages,
-        additionalInfo: {
-          turnCount: coreResponse.context?.turn_count,
-          sessionId: coreResponse.context?.session_id,
-          assistantId: coreResponse.context?.assistant_id,
-        },
+      // Construir contexto simplificado - apenas dados essenciais
+      const context: any = {
+        // DADOS DO USUÁRIO - JÁ AUTENTICADO
+        ...(userInfo && { user_info: userInfo }),
+
+        // IMPORTANTE: is_first_message é determinado pelo backend via CoreService.hasExistingThread
+        is_first_message: isFirstMessage,
+
+        // Session ID para referência
+        session_id: data.sessionId,
+
+        // Saudação baseada na hora local do usuário (Bom dia, Boa tarde, Boa noite)
+        greeting: finalGreeting,
+
+        // Data do navegador do usuário (se disponível) para uso em cálculos de data
+        ...(data.timestamp && { client_timestamp: data.timestamp }),
+        // Data atual do servidor como fallback
+        server_timestamp: new Date().toISOString(),
       };
+
+      // Log detalhado do contexto para debug
+      this.logger.log('Contexto sendo enviado ao Watson Orchestrate', {
+        hasUserInfo: !!userInfo,
+        isFirstMessage,
+        greeting: finalGreeting,
+        contextKeys: Object.keys(context),
+      });
+
+      const payload: CoreRunDto = {
+        message: {
+          type: 'text',
+          text: this.sanitizeTextForWatson(messageText),
+        },
+        conversationId: data.sessionId,
+        profileName: 'Widget User',
+        context: context,
+        channel: 'widget',
+        agentId: agentId, // Agent ID na raiz do payload
+      };
+
+      // Enviar apenas arquivos NÃO-áudio para o CoreService
+      // Arquivos de áudio já foram transcritos e o texto está na mensagem
+      const filesToProcess =
+        nonAudioFiles.length > 0 ? nonAudioFiles : undefined;
+
+      // Chamada direta ao CoreService novo
+      const coreResponse = await this.coreService.run(
+        payload,
+        null, // Assistant entity removida
+        filesToProcess, // Apenas arquivos não-áudio
+      );
+
+      let response: WidgetConversationResponseDto = {
+        success: true,
+        messages: [],
+        settings: {} as WidgetSettingsDto,
+        // Adicionar texto transcrito na resposta para que o widget possa atualizar a mensagem do usuário
+        ...(transcribedText && { transcribedText }),
+      };
+
+      // Padronizar a resposta do Watson independente da estrutura
+      const standardizedData = this.standardizeWatsonResponse(
+        coreResponse.response,
+        coreResponse.context,
+      );
+      response.messages = standardizedData.messages;
+
+      // Log do texto transcrito
+      if (transcribedText) {
+        this.logger.log('Texto transcrito disponível na resposta', {
+          transcribedTextLength: transcribedText.length,
+          transcribedTextPreview: transcribedText.substring(0, 100) + '...',
+        });
+      }
+      // const cleanedVariablesForDB = standardizedData.updatedVariables; // Usado para persistência, ignorado aqui por enquanto
+
+      if (
+        coreResponse.settings &&
+        Object.keys(coreResponse.settings).length > 0
+      ) {
+        response.settings = coreResponse.settings;
+      }
+
+      // Verificar se há mensagem de file_upload para ativar botão de anexos
+      // O botão só aparece quando o agente pede um arquivo e desaparece após enviar
+      const fileUploadMessage = standardizedData.messages.find(
+        (msg) => msg.component === 'file_upload',
+      );
+      const hasFileUpload = !!fileUploadMessage;
+      response.settings = {
+        ...response.settings,
+        botaoAnexo: hasFileUpload, // true só quando agente pede arquivo, false caso contrário
+        // Passar o ID do campo de upload para o widget usar ao enviar arquivos
+        ...(hasFileUpload &&
+          fileUploadMessage?.name && {
+            uploadFieldId: fileUploadMessage.name,
+          }),
+      };
+      if (hasFileUpload) {
+        this.logger.log('File upload detected, enabling attachment button', {
+          uploadFieldId: fileUploadMessage?.name,
+        });
+      }
+
+      // Adicionar contexto para debug no frontend
+      response.context = coreResponse.context as WidgetContextDto;
+
+      // Adicionar informações de debug do Watson (preservando lógica legada simplificada)
+      if (coreResponse.response?.output?.generic) {
+        const watsonResponse = coreResponse.response;
+        let nodesVisited: any[] = [];
+        let errors: any[] = [];
+        let logMessages: any[] = [];
+
+        watsonResponse.output.generic.forEach((msg: any) => {
+          if (msg.debug?.nodes_visited) nodesVisited = msg.debug.nodes_visited;
+          if (msg.debug?.errors) errors = msg.debug.errors;
+          if (msg.debug?.log_messages) logMessages = msg.debug.log_messages;
+        });
+
+        response.debug = {
+          nodesVisited,
+          errors,
+          logMessages,
+          additionalInfo: {
+            turnCount: coreResponse.context?.turn_count,
+            sessionId: coreResponse.context?.session_id,
+            assistantId: coreResponse.context?.assistant_id,
+          },
+        };
+      }
+
+      this.logger.log('Response', { messages: response.messages.length });
+
+      return response;
+    } catch (error) {
+      this.logger.error('Erro no método run', {
+        error: error.message,
+        stack: error.stack,
+        sessionId: data?.sessionId,
+      });
+      throw error;
     }
-
-    this.logger.log('Response', { messages: response.messages.length });
-
-    return response;
   }
 
   /**
@@ -335,6 +531,20 @@ export class BrokerWidgetService {
       hasData: !!data,
       hasFiles: !!files,
       filesCount: files?.length || 0,
+      files: files?.map((f) => ({
+        name: f.originalname,
+        mimetype: f.mimetype,
+        size: f.size,
+      })),
+    });
+    this.logger.log('runWithStreaming - Detalhes dos arquivos', {
+      filesCount: files?.length || 0,
+      files: files?.map((f) => ({
+        originalname: f.originalname,
+        mimetype: f.mimetype,
+        size: f.size,
+        bufferLength: f.buffer?.length || 0,
+      })),
     });
 
     const subject = new Subject<MessageEvent>();
@@ -449,7 +659,22 @@ export class BrokerWidgetService {
     files: Array<Express.Multer.File> | undefined,
     subject: Subject<MessageEvent>,
   ): Promise<void> {
-    console.log('[BrokerWidgetService] executeWithStatusEvents iniciado');
+    console.log('[BrokerWidgetService] executeWithStatusEvents iniciado', {
+      hasFiles: !!files,
+      filesCount: files?.length || 0,
+      files: files?.map((f) => ({
+        name: f.originalname,
+        mimetype: f.mimetype,
+        size: f.size,
+      })),
+    });
+    this.logger.log('executeWithStatusEvents - Início', {
+      hasFiles: !!files,
+      filesCount: files?.length || 0,
+      sessionId: data.sessionId,
+      hasText: !!data.text,
+      textLength: data.text?.length || 0,
+    });
     try {
       // Verificar se é a primeira mensagem baseado no mapeamento interno do CoreService
       // O backend controla o thread_id, não o widget
@@ -463,74 +688,62 @@ export class BrokerWidgetService {
       const agentId = data.assistantId;
 
       // Saudação: usar do widget (hora local do usuário) ou calcular no servidor como fallback
+      // SEMPRE calcular para garantir que esteja disponível no contexto
       const greeting =
         data.user?.greeting ||
         data.user?.context?.greeting ||
         this.getGreetingByTime();
 
-      // ===== AUTENTICAÇÃO AUTOMÁTICA NA PRIMEIRA MENSAGEM =====
+      // Garantir que greeting sempre seja uma string válida
+      const finalGreeting = greeting || this.getGreetingByTime();
+
+      // ===== AUTENTICAÇÃO AUTOMÁTICA (com cache) =====
+      // Obtém dados do usuário do cache ou autentica se necessário
+      // Nas mensagens subsequentes, reutiliza os dados já autenticados
+      const authResult = await this.getUserData(data.sessionId, chapa, emplid);
       let userData: any = null;
       let acessoRelatorios: any = null;
       let authError: string | null = null;
 
-      if (isFirstMessage) {
-        if (chapa) {
-          // Funcionário: autenticar por CHAPA
-          this.logger.log('Autenticando funcionário por CHAPA (streaming)', {
-            chapa,
-          });
-          const authResult = await this.authService.identifyEmployee(chapa);
-          if (authResult.success) {
-            userData = authResult.data;
-            acessoRelatorios = authResult.acessoRelatorios;
-            this.logger.log('Funcionário autenticado com sucesso');
-          } else {
-            authError =
-              authResult.error || 'Falha na autenticação do funcionário';
-            this.logger.warn('Falha na autenticação do funcionário', {
-              chapa,
-              error: authError,
-            });
-          }
-        } else if (emplid && emplid !== '0000000') {
-          // Aluno: autenticar por EMPLID
-          this.logger.log('Autenticando aluno por EMPLID (streaming)', {
-            emplid,
-          });
-          const authResult = await this.authService.identifyStudent(emplid);
-          if (authResult.success) {
-            userData = authResult.data;
-            this.logger.log('Aluno autenticado com sucesso');
-          } else {
-            authError = authResult.error || 'Falha na autenticação do aluno';
-            this.logger.warn('Falha na autenticação do aluno', {
-              emplid,
-              error: authError,
-            });
-          }
+      if (authResult) {
+        // Verificar se é um erro
+        if ('error' in authResult) {
+          authError = authResult.error;
         } else {
-          // Nenhum identificador fornecido
-          authError =
-            'Nenhum identificador de usuário fornecido (chapa ou emplid)';
-          this.logger.warn('Tentativa de acesso sem identificador de usuário');
+          userData = authResult.userData;
+          acessoRelatorios = authResult.acessoRelatorios;
         }
+      }
 
-        // ===== BLOQUEAR ACESSO SE AUTENTICAÇÃO FALHOU =====
-        if (!userData) {
+      // Se não conseguiu autenticar, bloquear acesso na primeira mensagem
+      if (!userData) {
+        if (isFirstMessage) {
+          authError =
+            authError ||
+            'Nenhum identificador de usuário fornecido ou falha na autenticação';
           const errorCode = this.generateErrorCode();
           this.logger.error('Acesso negado: usuário não autenticado', {
             authError,
             errorCode,
           });
 
-          const errorDetails = authError
-            ? `\n\n**Detalhes do erro:** ${authError}`
-            : '';
+          // Se for erro de serviço indisponível, mostrar apenas a mensagem do erro
+          // Caso contrário, mostrar mensagem genérica + detalhes
+          const isServiceUnavailable =
+            authError && authError.includes('temporariamente indisponível');
+          const errorMessage = isServiceUnavailable
+            ? authError
+            : 'Você não tem permissão de acesso aos recursos do assistente virtual. Verifique se está logado corretamente ou entre em contato com o suporte.';
+          const errorDetails =
+            !isServiceUnavailable && authError
+              ? `\n\n**Detalhes:** ${authError}`
+              : '';
 
-          const errorMessage = {
+          const errorMessageObj = {
             sender: 'ai',
             message:
-              '**Não foi possível autenticar o usuário.**\n\nVocê não tem permissão de acesso aos recursos do assistente virtual. Verifique se está logado corretamente ou entre em contato com o suporte.' +
+              '**Não foi possível autenticar o usuário.**\n\n' +
+              errorMessage +
               errorDetails +
               `\n\n**Código do erro:** \`${errorCode}\``,
             messageId: `error_${Date.now()}`,
@@ -542,7 +755,7 @@ export class BrokerWidgetService {
             data: JSON.stringify({
               event: 'response',
               data: {
-                messages: [errorMessage],
+                messages: [errorMessageObj],
                 settings: {},
               },
             }),
@@ -552,6 +765,13 @@ export class BrokerWidgetService {
           subject.complete();
           return;
         }
+        // Nas mensagens subsequentes, apenas logar o aviso mas continuar
+        this.logger.warn(
+          'Dados do usuário não disponíveis no cache e não foi possível autenticar (streaming)',
+          {
+            sessionId: data.sessionId,
+          },
+        );
       }
 
       // Construir user_info com dados do usuário autenticado
@@ -562,25 +782,144 @@ export class BrokerWidgetService {
           }
         : null;
 
+      // Transcrever áudio ANTES de enviar para o Orchestrate (mesma lógica do método run)
+      // Arquivos de áudio não são enviados para S3 nem para Orchestrate
+      // Apenas o texto transcrito é enviado como mensagem de texto
+      const hasFiles = !!files && files.length > 0;
+      let transcribedText: string | null = null;
+      let audioFiles: Array<Express.Multer.File> = [];
+      let nonAudioFiles: Array<Express.Multer.File> = [];
+
+      this.logger.log('Verificando arquivos para transcrição (streaming)', {
+        hasFiles,
+        filesCount: files?.length || 0,
+        files: files?.map((f) => ({
+          name: f.originalname,
+          mimetype: f.mimetype,
+          size: f.size,
+        })),
+      });
+
+      if (hasFiles && files) {
+        this.logger.log(
+          'Processando arquivos - Separando áudio de outros arquivos',
+          {
+            totalFiles: files.length,
+          },
+        );
+
+        // Separar arquivos de áudio dos outros arquivos
+        audioFiles = files.filter(
+          (file) =>
+            file.mimetype?.startsWith('audio/') ||
+            file.originalname?.match(/\.(wav|webm|ogg|flac|mp3|m4a)$/i),
+        );
+        nonAudioFiles = files.filter(
+          (file) =>
+            !file.mimetype?.startsWith('audio/') &&
+            !file.originalname?.match(/\.(wav|webm|ogg|flac|mp3|m4a)$/i),
+        );
+
+        this.logger.log('Arquivos separados', {
+          audioFilesCount: audioFiles.length,
+          nonAudioFilesCount: nonAudioFiles.length,
+          audioFiles: audioFiles.map((f) => ({
+            name: f.originalname,
+            mimetype: f.mimetype,
+          })),
+        });
+
+        // Transcrever o primeiro arquivo de áudio encontrado
+        if (audioFiles.length > 0) {
+          const audioFile = audioFiles[0];
+          try {
+            this.logger.log(
+              'Transcrevendo áudio enviado pelo usuário (streaming)',
+              {
+                fileName: audioFile.originalname,
+                mimetype: audioFile.mimetype,
+                bufferSize: audioFile.buffer.length,
+              },
+            );
+
+            // O serviço de Speech-to-Text aceita apenas: audio/wav, audio/flac, audio/ogg, audio/ogg;codecs=opus
+            // WebM não é suportado e será rejeitado com erro claro
+            transcribedText = await this.speechToTextService.recognize(
+              audioFile.buffer,
+              audioFile.mimetype || 'audio/ogg',
+            );
+            this.logger.log('Áudio transcrito com sucesso (streaming)', {
+              textLength: transcribedText.length,
+              transcribedText:
+                transcribedText.substring(0, 100) +
+                (transcribedText.length > 100 ? '...' : ''),
+            });
+          } catch (error) {
+            this.logger.error('Erro ao transcrever áudio (streaming)', {
+              error: error.message,
+              stack: error.stack,
+            });
+            transcribedText = null;
+          }
+        } else {
+          this.logger.log(
+            'Nenhum arquivo de áudio encontrado para transcrição (streaming)',
+          );
+        }
+      }
+
+      // Construir o texto da mensagem: usar texto transcrito se houver áudio, senão usar texto original
+      // Se for primeira mensagem e estiver vazia, enviar "oi" para iniciar a conversa
+      let messageText = transcribedText || data.text || '';
+      if (isFirstMessage && !messageText.trim()) {
+        messageText = 'oi';
+        this.logger.log(
+          'Primeira mensagem vazia, enviando "oi" automaticamente (streaming)',
+        );
+      }
+
+      this.logger.log('Construindo payload com texto da mensagem (streaming)', {
+        hasTranscribedText: !!transcribedText,
+        transcribedTextLength: transcribedText?.length || 0,
+        hasOriginalText: !!data.text,
+        originalTextLength: data.text?.length || 0,
+        finalMessageText:
+          messageText.substring(0, 100) +
+          (messageText.length > 100 ? '...' : ''),
+        finalMessageTextLength: messageText.length,
+      });
+
       const payload: CoreRunDto = {
         message: {
           type: 'text',
-          text: this.sanitizeTextForWatson(data.text || ''),
+          text: this.sanitizeTextForWatson(messageText),
         },
         conversationId: data.sessionId,
         profileName: 'Widget User',
-        context: {
-          ...(agentId && { agent_id: agentId }),
-          // Dados do usuário autenticado dentro de user_info
-          ...(userInfo && { user_info: userInfo }),
-          // thread_id é gerenciado internamente pelo CoreService
-          // is_first_message é determinado pelo backend via CoreService.hasExistingThread
-          is_first_message: isFirstMessage,
-          session_id: data.sessionId,
-          // Saudação baseada na hora local do usuário
-          greeting: greeting,
-        },
+        context: (() => {
+          // Construir contexto simplificado - apenas dados essenciais
+          const ctx: any = {
+            // DADOS DO USUÁRIO - JÁ AUTENTICADO
+            ...(userInfo && { user_info: userInfo }),
+
+            // IMPORTANTE: is_first_message é determinado pelo backend via CoreService.hasExistingThread
+            is_first_message: isFirstMessage,
+
+            // Session ID para referência
+            session_id: data.sessionId,
+
+            // Saudação baseada na hora local do usuário (Bom dia, Boa tarde, Boa noite)
+            greeting: finalGreeting,
+
+            // Data do navegador do usuário (se disponível) para uso em cálculos de data
+            ...(data.timestamp && { client_timestamp: data.timestamp }),
+            // Data atual do servidor como fallback
+            server_timestamp: new Date().toISOString(),
+          };
+          return ctx;
+        })(),
         channel: 'widget',
+        agentId: agentId, // Agent ID na raiz do payload
       };
 
       // Callback para emitir eventos de status
@@ -600,10 +939,13 @@ export class BrokerWidgetService {
       };
 
       // Chamar o CoreService com callback de status
+      // Passar apenas arquivos não-áudio (arquivos de áudio já foram transcritos)
+      const filesToProcess =
+        nonAudioFiles.length > 0 ? nonAudioFiles : undefined;
       const coreResponse = await this.coreService.run(
         payload,
         null,
-        files,
+        filesToProcess, // Apenas arquivos não-áudio
         onStatus,
       );
 
@@ -631,6 +973,8 @@ export class BrokerWidgetService {
             }),
         } as WidgetSettingsDto,
         context: coreResponse.context as WidgetContextDto,
+        // Adicionar texto transcrito na resposta para que o widget possa atualizar a mensagem do usuário
+        ...(transcribedText && { transcribedText }),
       };
 
       // Emitir resposta final

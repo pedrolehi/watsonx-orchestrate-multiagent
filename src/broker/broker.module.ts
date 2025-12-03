@@ -2,9 +2,9 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { BrokerWidgetModule } from './broker-widget/broker-widget.module';
 import { BrokerController } from './broker.controller';
-import { TextToSpeechModule } from '../watsonxorchestrate/text-to-speech.module';
-import { SpeechToTextModule } from '../watsonxorchestrate/speech-to-text.module';
-import { AudioCacheService } from '../watsonxorchestrate/audio-cache.service';
+import { TextToSpeechModule } from '../audio/text-to-speech/text-to-speech.module';
+import { SpeechToTextModule } from '../audio/speech-to-text/speech-to-text.module';
+import { AudioCacheModule } from '../audio/audio-cache/audio-cache.module';
 
 @Module({
   imports: [
@@ -12,9 +12,8 @@ import { AudioCacheService } from '../watsonxorchestrate/audio-cache.service';
     AuthModule,
     TextToSpeechModule,
     SpeechToTextModule,
+    AudioCacheModule,
   ],
   controllers: [BrokerController],
-  providers: [AudioCacheService],
-  exports: [AudioCacheService],
 })
 export class BrokerModule {}

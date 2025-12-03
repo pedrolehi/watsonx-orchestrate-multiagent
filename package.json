@@ -20,6 +20,7 @@
     "test:e2e": "jest --config ./test/jest-e2e.json"
   },
   "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.2",
     "@nestjs/core": "^11.0.1",
@@ -46,6 +47,7 @@
     "multer": "^2.0.2",
     "nestjs-zod": "^5.0.1",
     "node-cron": "^4.2.1",
+    "pnpm": "^10.24.0",
     "qs": "^6.14.0",
     "react-voice-visualizer": "^2.0.8",
     "redoc-express": "^2.1.3",

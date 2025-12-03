@@ -40,6 +40,10 @@ export class CoreRunDto {
 
   @IsString()
   channel: string;
+
+  @IsString()
+  @IsOptional()
+  agentId?: string; // Agent ID na raiz do payload (vem do widget como assistantId)
 }
 
 export class CoreRunResponseDto {
