@@ -20,6 +20,22 @@ export class WatsonxService {
   private readonly instanceId: string;
   private readonly apiKey: string;
 
+  // Rastrear a última mensagem do assistente enviada por thread
+  // threadId -> timestamp da última mensagem do assistente enviada
+  private readonly lastSentAssistantMessageTime = new Map<string, number>();
+
+  // Histórico unificado de conversa em memória
+  // threadId -> Map<messageId, { message, source: 'run' | 'polling', timestamp }>
+  // Prioridade: mensagens do run (streaming) têm prioridade sobre polling
+  private readonly conversationHistory = new Map<
+    string,
+    Map<string, { message: any; source: 'run' | 'polling'; timestamp: number }>
+  >();
+
+  // Rastrear mensagens já enviadas ao frontend
+  // threadId -> Set<messageId>
+  private readonly sentMessageIds = new Map<string, Set<string>>();
+
   constructor(private readonly configService: ConfigService) {
     const envUrl = this.configService.get<string>('ORCHESTRATE_URL');
     if (!envUrl) {
@@ -52,6 +68,10 @@ export class WatsonxService {
     this.axiosInstance = axios.create({
       baseURL,
     });
+
+    // Métodos privados para gerenciar histórico unificado
+    this.addMessageToHistory = this.addMessageToHistory.bind(this);
+    this.getHistoryMessages = this.getHistoryMessages.bind(this);
 
     // Interceptor de REQUEST para adicionar autenticação
     this.axiosInstance.interceptors.request.use(
@@ -155,55 +175,6 @@ export class WatsonxService {
     }
 
     return processed;
-  }
-
-  /**
-   * Formata a resposta do saldo de horas em markdown
-   */
-  private formatSaldoHorasResponse(
-    saldoAnterior: string | null | undefined,
-    saldoAtual: string | null | undefined,
-  ): string {
-    const parts: string[] = [];
-
-    parts.push('## Relatório de Saldo de Banco de Horas\n');
-
-    // Saldo anterior (mês fechado)
-    if (saldoAnterior !== undefined && saldoAnterior !== null) {
-      parts.push(
-        `**Saldo do banco de horas até outubro (mês fechado):** **${saldoAnterior}**\n`,
-      );
-    }
-
-    parts.push('\n---\n\n');
-
-    // Prévia do mês atual
-    parts.push('### Prévia do Mês Atual\n');
-    if (saldoAtual !== undefined && saldoAtual !== null) {
-      if (saldoAtual.toLowerCase().includes('não apurado')) {
-        parts.push(
-          `**Prévia do banco de horas do mês de novembro:** Ponto não apurado\n`,
-        );
-      } else {
-        parts.push(
-          `**Prévia do banco de horas do mês de novembro:** ${saldoAtual}\n`,
-        );
-      }
-    } else {
-      parts.push(
-        '**Prévia do banco de horas do mês de novembro:** Ponto não apurado\n',
-      );
-    }
-
-    parts.push('\n---\n\n');
-
-    // Aviso
-    parts.push('### Atenção\n');
-    parts.push(
-      '> **Atenção:** O saldo de banco de horas é referente ao ponto do **mês fechado** e poderá ser ajustado conforme correções solicitadas pelo setor administrativo.\n',
-    );
-
-    return parts.join('');
   }
 
   private async getIamToken(): Promise<string> {
@@ -638,6 +609,77 @@ export class WatsonxService {
       // thread_id só é enviado a partir da segunda mensagem
       if (threadId) {
         payload.thread_id = threadId;
+
+        // Antes de enviar nova mensagem, rastrear a última mensagem do assistente já enviada
+        // Isso evita reenviar mensagens antigas do thread
+        try {
+          // Se já temos um timestamp rastreado, usar ele (mais eficiente)
+          const existingTimestamp =
+            this.lastSentAssistantMessageTime.get(threadId);
+          if (existingTimestamp) {
+            this.logger.debug(
+              'Usando timestamp já rastreado da última mensagem do assistente',
+              {
+                threadId,
+                timestamp: new Date(existingTimestamp).toISOString(),
+              },
+            );
+          } else {
+            // Se não temos, buscar do thread
+            const existingMessages = await this.getThreadMessages(threadId);
+            const assistantMessages = existingMessages.filter(
+              (msg: any) => msg.role === 'assistant',
+            );
+
+            if (assistantMessages.length > 0) {
+              // Pegar a última mensagem do assistente
+              const lastAssistantMsg =
+                assistantMessages[assistantMessages.length - 1];
+              if (lastAssistantMsg.created_at) {
+                const lastTime = new Date(
+                  lastAssistantMsg.created_at,
+                ).getTime();
+                this.lastSentAssistantMessageTime.set(threadId, lastTime);
+                this.logger.debug(
+                  'Rastreada última mensagem do assistente antes de enviar nova mensagem',
+                  {
+                    threadId,
+                    lastMessageId: lastAssistantMsg.id,
+                    lastMessageTime: lastAssistantMsg.created_at,
+                    timestamp: lastTime,
+                    totalMessages: assistantMessages.length,
+                  },
+                );
+              } else {
+                this.logger.debug(
+                  'Última mensagem do assistente não tem created_at',
+                  {
+                    threadId,
+                    lastMessageId: lastAssistantMsg.id,
+                    hasCreatedAt: !!lastAssistantMsg.created_at,
+                  },
+                );
+              }
+            } else {
+              this.logger.debug(
+                'Nenhuma mensagem do assistente encontrada no thread',
+                {
+                  threadId,
+                  totalMessages: existingMessages.length,
+                },
+              );
+            }
+          }
+        } catch (error: any) {
+          // Não é crítico se falhar - apenas logar
+          this.logger.debug(
+            'Não foi possível buscar última mensagem do assistente (não crítico)',
+            {
+              threadId,
+              error: error.message,
+            },
+          );
+        }
       }
 
       // Log detalhado do payload sendo enviado ao Watson Orchestrate
@@ -1110,44 +1152,154 @@ export class WatsonxService {
             }
           }
 
+          // IMPORTANTE: Enviar mensagem "Tool is processing..." imediatamente se detectada
+          // Antes de fazer polling, enviar a mensagem que já temos
+          if (messageCreated?.content && threadId) {
+            const processingContent = messageCreated.content.map(
+              (item: any) => {
+                // Adicionar metadados necessários para toolInfo
+                return {
+                  ...item,
+                  ...(messageCreated.step_history && {
+                    _step_history: messageCreated.step_history,
+                  }),
+                  ...(flowInstanceId && {
+                    _flow_instance_id: flowInstanceId,
+                  }),
+                  ...(messageCreated.id && {
+                    _message_id: messageCreated.id,
+                  }),
+                  ...(messageCreated.additional_properties?.display_properties
+                    ?.is_async && {
+                    _is_async:
+                      messageCreated.additional_properties.display_properties
+                        .is_async,
+                  }),
+                };
+              },
+            );
+
+            // Adicionar ao histórico imediatamente
+            if (messageCreated.id) {
+              this.addMessageToHistory(threadId, messageCreated, 'run');
+            }
+
+            // Enviar mensagem imediatamente via onStatus ou response
+            const immediateResponse = {
+              output: {
+                generic: processingContent,
+              },
+              thread_id: threadId,
+            };
+
+            this.logger.debug(
+              'Mensagem "Tool is processing..." adicionada ao histórico, continuando com polling',
+              {
+                messageId: messageCreated.id,
+                flowInstanceId,
+                contentLength: processingContent.length,
+              },
+            );
+
+            // NÃO retornar aqui - continuar com o polling para buscar a resposta final
+            // A mensagem "Tool is processing..." já foi adicionada ao histórico unificado
+            // e será incluída no resultado final do polling
+          }
+
           // Fazer polling para buscar mensagens adicionais
           if (threadId) {
             try {
+              // Passar o timestamp da última mensagem enviada para filtrar no polling
+              const lastSentTimeForPolling =
+                this.lastSentAssistantMessageTime.get(threadId);
               const allMessages = await this.pollThreadMessages(
                 threadId,
                 20,
                 2000,
                 60000,
                 onStatus,
+                lastSentTimeForPolling,
               );
               // Filtrar apenas mensagens do assistente
               const assistantMessages = allMessages.filter(
                 (msg: any) => msg.role === 'assistant',
               );
 
-              // Filtrar mensagens que não são de "Tool is processing"
-              const validMessages = assistantMessages.filter((msg: any) => {
+              // NÃO FILTRAR mensagens "Tool is processing" - elas devem ser enviadas imediatamente
+              // Extrair payload da tool do step_history para debug
+              const validMessages = assistantMessages.map((msg: any) => {
                 const hasProcessingText = msg.content?.some(
                   (item: any) =>
                     item.text?.includes('Tool is processing') ||
                     item.text?.includes('Please wait until the tool completes'),
                 );
-                return !hasProcessingText;
+
+                // Se for mensagem de processamento, extrair e logar payload da tool
+                if (hasProcessingText) {
+                  const toolPayload = this.extractToolPayloadFromStepHistory(
+                    msg.step_history,
+                  );
+                  this.logger.debug(
+                    'Mensagem "Tool is processing" detectada (será enviada)',
+                    {
+                      messageId: msg.id,
+                      content: msg.content,
+                      toolPayload: toolPayload,
+                      stepHistory: msg.step_history,
+                    },
+                  );
+                }
+
+                return msg; // Retornar todas as mensagens, incluindo "Tool is processing"
               });
 
-              // IMPORTANTE: Pegar apenas a ÚLTIMA mensagem do assistente
-              // Evita duplicação ao continuar conversas existentes
-              const finalMessages =
-                validMessages.length > 0
-                  ? [validMessages[validMessages.length - 1]]
-                  : [];
+              // SIMPLIFICADO: Filtrar apenas por ID e role
+              // Se o ID já foi renderizado, não incluir
+              // Apenas incluir mensagens do assistente (role !== 'user')
+              const seenMessageIds = new Set<string>();
+              const finalMessages = validMessages.filter((msg: any) => {
+                // Deve ter ID
+                if (!msg.id) {
+                  return false;
+                }
+
+                // Se já foi renderizado (está no seenMessageIds), não incluir
+                if (seenMessageIds.has(msg.id)) {
+                  this.logger.debug('Mensagem duplicada por ID (ignorada)', {
+                    messageId: msg.id,
+                    role: msg.role,
+                  });
+                  return false;
+                }
+
+                // Apenas mensagens do assistente (não incluir mensagens do usuário)
+                if (msg.role === 'user') {
+                  return false;
+                }
+
+                // Adicionar ao Set de IDs vistos
+                seenMessageIds.add(msg.id);
+                return true;
+              });
 
               // Acumular todo o conteúdo das mensagens finais
               // Preservar text quando existir junto com options ou outros tipos
               const allContent: any[] = [];
               const userActivities: any[] = [];
 
+              // Adicionar mensagens do run ao histórico unificado
               finalMessages.forEach((msg: any) => {
+                if (threadId && msg.id) {
+                  this.addMessageToHistory(threadId, msg, 'run');
+                }
+              });
+
+              // Obter apenas mensagens novas do histórico unificado (ainda não enviadas)
+              const historyMessages = threadId
+                ? this.getNewHistoryMessages(threadId)
+                : finalMessages;
+
+              historyMessages.forEach((msg: any) => {
                 // Capturar flowinstance_id das mensagens se disponível
                 const msgFlowInstanceId =
                   msg.response_metadata?.flowinstance_id ||
@@ -1189,10 +1341,68 @@ export class WatsonxService {
                         ...item,
                         text: item.text, // Garantir que text seja preservado
                         options: item.options,
+                        // Adicionar step_history para extrair toolInfo no widget
+                        ...(msg.step_history && {
+                          _step_history: msg.step_history,
+                        }),
+                        // Adicionar flowInstanceId para buscar tasks quando necessário
+                        ...(flowInstanceId && {
+                          _flow_instance_id: flowInstanceId,
+                        }),
+                        // Adicionar parent_message_id e message_id para mapear relação pai-filho
+                        ...(msg.parent_message_id && {
+                          _parent_message_id: msg.parent_message_id,
+                        }),
+                        ...(msg.id && {
+                          _message_id: msg.id,
+                        }),
+                        // Adicionar flags de async para detectar mensagens "Tool is processing..."
+                        ...(msg.additional_properties?.display_properties
+                          ?.is_async && {
+                          _is_async:
+                            msg.additional_properties.display_properties
+                              .is_async,
+                        }),
+                        ...(msg.additional_properties?.display_properties
+                          ?.skip_render && {
+                          _skip_render:
+                            msg.additional_properties.display_properties
+                              .skip_render,
+                        }),
                       });
                     } else {
-                      // Caso contrário, adicionar como está
-                      allContent.push(item);
+                      // Caso contrário, adicionar como está, mas incluir step_history
+                      allContent.push({
+                        ...item,
+                        // Adicionar step_history para extrair toolInfo no widget
+                        ...(msg.step_history && {
+                          _step_history: msg.step_history,
+                        }),
+                        // Adicionar flowInstanceId para buscar tasks quando necessário
+                        ...(flowInstanceId && {
+                          _flow_instance_id: flowInstanceId,
+                        }),
+                        // Adicionar parent_message_id e message_id para mapear relação pai-filho
+                        ...(msg.parent_message_id && {
+                          _parent_message_id: msg.parent_message_id,
+                        }),
+                        ...(msg.id && {
+                          _message_id: msg.id,
+                        }),
+                        // Adicionar flags de async para detectar mensagens "Tool is processing..."
+                        ...(msg.additional_properties?.display_properties
+                          ?.is_async && {
+                          _is_async:
+                            msg.additional_properties.display_properties
+                              .is_async,
+                        }),
+                        ...(msg.additional_properties?.display_properties
+                          ?.skip_render && {
+                          _skip_render:
+                            msg.additional_properties.display_properties
+                              .skip_render,
+                        }),
+                      });
                     }
                   });
                 }
@@ -1201,6 +1411,24 @@ export class WatsonxService {
               // Adicionar user activities ao debug se houver
               if (userActivities.length > 0) {
                 debugInfo.userActivities = userActivities;
+              }
+
+              // Atualizar timestamp da última mensagem enviada após processar (async)
+              if (threadId && historyMessages.length > 0) {
+                const lastMessage = historyMessages[historyMessages.length - 1];
+                if (lastMessage.created_at) {
+                  const lastTime = new Date(lastMessage.created_at).getTime();
+                  this.lastSentAssistantMessageTime.set(threadId, lastTime);
+                  this.logger.debug(
+                    'Atualizado timestamp da última mensagem do assistente enviada (async)',
+                    {
+                      threadId,
+                      lastMessageId: lastMessage.id,
+                      lastMessageTime: lastMessage.created_at,
+                      timestamp: lastTime,
+                    },
+                  );
+                }
               }
 
               if (allContent.length > 0) {
@@ -1219,12 +1447,46 @@ export class WatsonxService {
               // Fallback para conteúdo inicial
               if (messageCreated?.content) {
                 response.output.generic = messageCreated.content;
+
+                // Atualizar timestamp mesmo no fallback
+                if (threadId && messageCreated.created_at) {
+                  const lastTime = new Date(
+                    messageCreated.created_at,
+                  ).getTime();
+                  this.lastSentAssistantMessageTime.set(threadId, lastTime);
+                  this.logger.debug(
+                    'Atualizado timestamp da última mensagem (fallback)',
+                    {
+                      threadId,
+                      messageId: messageCreated.id,
+                      timestamp: lastTime,
+                    },
+                  );
+                }
               }
             }
           } else {
             // Sem thread_id, usar conteúdo inicial
             if (messageCreated?.content) {
               response.output.generic = messageCreated.content;
+
+              // Se tiver threadId do response, atualizar timestamp
+              const responseThreadId = response.thread_id;
+              if (responseThreadId && messageCreated.created_at) {
+                const lastTime = new Date(messageCreated.created_at).getTime();
+                this.lastSentAssistantMessageTime.set(
+                  responseThreadId,
+                  lastTime,
+                );
+                this.logger.debug(
+                  'Atualizado timestamp da última mensagem (primeira mensagem)',
+                  {
+                    threadId: responseThreadId,
+                    messageId: messageCreated.id,
+                    timestamp: lastTime,
+                  },
+                );
+              }
             }
           }
         } else {
@@ -1232,54 +1494,130 @@ export class WatsonxService {
           // (pode haver options ou user activities em mensagens subsequentes)
           if (threadId) {
             try {
+              // Passar o timestamp da última mensagem enviada para filtrar no polling
+              const lastSentTimeForPolling =
+                this.lastSentAssistantMessageTime.get(threadId);
               const allMessages = await this.pollThreadMessages(
                 threadId,
                 20,
                 2000,
                 60000,
                 onStatus,
+                lastSentTimeForPolling,
               );
               const assistantMessages = allMessages.filter(
                 (msg: any) => msg.role === 'assistant',
               );
 
-              // Pegar apenas a ÚLTIMA mensagem do assistente (a resposta atual)
-              // Não acumular todas as mensagens anteriores
-              const lastAssistantMessage =
-                assistantMessages[assistantMessages.length - 1];
+              // Manter múltiplas mensagens válidas sem duplicatas
+              // IMPORTANTE: Filtrar apenas mensagens criadas DEPOIS da última mensagem do assistente já enviada
+              // (já filtrado no polling, mas manter para compatibilidade)
+              const lastSentTimeForFilter = threadId
+                ? this.lastSentAssistantMessageTime.get(threadId)
+                : undefined;
 
+              // Usar Set baseado em message ID para deduplicação eficiente O(n)
+              // IDs diferentes = mensagens diferentes (mesmo que conteúdo seja igual)
+              const seenMessageIds = new Set<string>();
+              const uniqueMessages = assistantMessages.filter((msg: any) => {
+                // Filtrar apenas mensagens criadas DEPOIS da última mensagem já enviada
+                // (já filtrado no polling, mas manter para segurança)
+                // SIMPLIFICADO: Filtrar apenas por ID e role
+                // Deve ter ID
+                if (!msg.id) {
+                  return false;
+                }
+
+                // Se já foi renderizado (está no seenMessageIds), não incluir
+                if (seenMessageIds.has(msg.id)) {
+                  this.logger.debug('Mensagem duplicada por ID (ignorada)', {
+                    messageId: msg.id,
+                    role: msg.role,
+                  });
+                  return false;
+                }
+
+                // Apenas mensagens do assistente (não incluir mensagens do usuário)
+                if (msg.role === 'user') {
+                  return false;
+                }
+
+                // Adicionar ao Set de IDs vistos
+                seenMessageIds.add(msg.id);
+                return true;
+              });
+
+              // Adicionar mensagens do polling ao histórico unificado
+              uniqueMessages.forEach((msg: any) => {
+                if (threadId && msg.id) {
+                  this.addMessageToHistory(threadId, msg, 'polling');
+                }
+              });
+
+              // Obter apenas mensagens novas do histórico unificado (ainda não enviadas)
+              const historyMessages = threadId
+                ? this.getNewHistoryMessages(threadId)
+                : uniqueMessages;
+
+              // Atualizar timestamp da última mensagem enviada após processar
+              if (threadId && historyMessages.length > 0) {
+                const lastMessage = historyMessages[historyMessages.length - 1];
+                if (lastMessage.created_at) {
+                  const lastTime = new Date(lastMessage.created_at).getTime();
+                  this.lastSentAssistantMessageTime.set(threadId, lastTime);
+                  this.logger.debug(
+                    'Atualizado timestamp da última mensagem do assistente enviada (normal)',
+                    {
+                      threadId,
+                      lastMessageId: lastMessage.id,
+                      lastMessageTime: lastMessage.created_at,
+                      timestamp: lastTime,
+                    },
+                  );
+                }
+              }
+
+              // Manter todas as mensagens únicas (não apenas a última)
+              // Isso evita perder mensagens geradas durante o polling
               const allContent: any[] = [];
               const userActivities: any[] = [];
 
-              if (lastAssistantMessage) {
+              // Processar todas as mensagens do histórico unificado
+              historyMessages.forEach((msg: any) => {
                 // Detectar user activity
-                const userActivity =
-                  this.detectUserActivity(lastAssistantMessage);
+                const userActivity = this.detectUserActivity(msg);
                 if (userActivity) {
                   userActivities.push({
-                    messageId: lastAssistantMessage.id,
+                    messageId: msg.id,
                     ...userActivity,
                   });
                 }
 
-                if (
-                  lastAssistantMessage.content &&
-                  Array.isArray(lastAssistantMessage.content)
-                ) {
-                  lastAssistantMessage.content.forEach((item: any) => {
+                if (msg.content && Array.isArray(msg.content)) {
+                  msg.content.forEach((item: any) => {
                     // Preservar text e options quando ambos existirem
                     if (item.text && item.options) {
                       allContent.push({
                         ...item,
                         text: item.text,
                         options: item.options,
+                        // Adicionar step_history para extrair toolInfo no widget
+                        ...(msg.step_history && {
+                          _step_history: msg.step_history,
+                        }),
                       });
                     } else {
-                      allContent.push(item);
+                      // Adicionar step_history para extrair toolInfo no widget
+                      allContent.push({
+                        ...item,
+                        ...(msg.step_history && {
+                          _step_history: msg.step_history,
+                        }),
+                      });
                     }
                   });
                 }
-              }
+              });
 
               // Adicionar user activities ao debug se houver
               if (userActivities.length > 0) {
@@ -2005,8 +2343,39 @@ export class WatsonxService {
         }
 
         // Adicionar thread_id se disponível
-        if (threadId) {
-          response.thread_id = threadId;
+        const finalThreadId = threadId || response.thread_id;
+        if (finalThreadId) {
+          response.thread_id = finalThreadId;
+
+          // Atualizar timestamp da última mensagem enviada após processar resposta completa
+          // Isso garante que na próxima requisição apenas mensagens novas sejam incluídas
+          if (messageCreated?.created_at) {
+            const lastTime = new Date(messageCreated.created_at).getTime();
+            this.lastSentAssistantMessageTime.set(finalThreadId, lastTime);
+            this.logger.debug(
+              'Atualizado timestamp da última mensagem do assistente enviada (após processar resposta)',
+              {
+                threadId: finalThreadId,
+                messageId: messageCreated.id,
+                lastMessageTime: messageCreated.created_at,
+                timestamp: lastTime,
+                wasNewThread: !threadId,
+              },
+            );
+          } else if (response.output?.generic?.length > 0) {
+            // Se não temos messageCreated mas temos conteúdo, tentar usar o timestamp atual
+            // (fallback para garantir que sempre atualizamos)
+            const currentTime = Date.now();
+            this.lastSentAssistantMessageTime.set(finalThreadId, currentTime);
+            this.logger.debug(
+              'Atualizado timestamp da última mensagem (fallback com timestamp atual)',
+              {
+                threadId: finalThreadId,
+                timestamp: currentTime,
+                reason: 'messageCreated sem created_at',
+              },
+            );
+          }
         }
 
         // Adicionar informações de debug
@@ -2018,111 +2387,12 @@ export class WatsonxService {
           ...debugInfo,
         };
 
-        // Interceptar e melhorar resposta do flow de saldo de horas
-        try {
-          const flowInstanceId =
-            debugInfo.flowInstanceId ||
-            messageCreated?.response_metadata?.flowinstance_id;
-
-          if (flowInstanceId) {
-            const flowInstance = await this.getFlowInstances({
-              instance_id: flowInstanceId,
-            });
-
-            if (flowInstance) {
-              const instance = Array.isArray(flowInstance)
-                ? flowInstance[0]
-                : flowInstance;
-
-              // Verificar se é o flow de saldo de horas
-              if (
-                instance.name === 'GEP_FLOW_consulta_saldo_horas' &&
-                instance.state === 'completed' &&
-                instance.tasks
-              ) {
-                this.logger.log('Flow de saldo de horas detectado', {
-                  flowInstanceId,
-                  flowName: instance.name,
-                  state: instance.state,
-                  tasksCount: instance.tasks.length,
-                });
-
-                const saldoHorasTask = instance.tasks.find(
-                  (task: any) => task.name === 'get_saldo_horas',
-                );
-
-                if (!saldoHorasTask) {
-                  this.logger.warn('Task get_saldo_horas não encontrada', {
-                    availableTasks: instance.tasks.map((t: any) => t.name),
-                  });
-                }
-
-                if (saldoHorasTask?.output?.data) {
-                  const outputData = saldoHorasTask.output.data;
-                  let saldoInfo: any = null;
-
-                  // Tentar parsear o outputData se for string
-                  if (typeof outputData === 'string') {
-                    try {
-                      saldoInfo = JSON.parse(outputData);
-                    } catch {
-                      // Se não conseguir parsear, tentar usar como está
-                      this.logger.warn(
-                        'Could not parse saldo horas outputData as JSON',
-                        { outputData: outputData.substring(0, 200) },
-                      );
-                    }
-                  } else {
-                    saldoInfo = outputData;
-                  }
-
-                  // Extrair dados do info se existir
-                  // O output pode ter a estrutura: {error: null, info: {...}, status: 200}
-                  // ou diretamente: {saldo_anterior: "...", saldo_atual: "..."}
-                  const info = saldoInfo?.info || saldoInfo;
-                  const saldoAnterior =
-                    info?.saldo_anterior || saldoInfo?.saldo_anterior;
-                  const saldoAtual =
-                    info?.saldo_atual || saldoInfo?.saldo_atual;
-
-                  if (saldoAnterior !== undefined || saldoAtual !== undefined) {
-                    // Construir resposta formatada em markdown
-                    const formattedResponse = this.formatSaldoHorasResponse(
-                      saldoAnterior,
-                      saldoAtual,
-                    );
-
-                    // Substituir a resposta ruim pela formatada
-                    response.output.generic = [
-                      {
-                        response_type: 'text',
-                        text: formattedResponse,
-                      },
-                    ];
-
-                    this.logger.log('Saldo de horas response improved', {
-                      flowInstanceId,
-                      saldoAnterior,
-                      saldoAtual,
-                    });
-                  }
-                }
-              }
-            }
-          }
-        } catch (improveError: any) {
-          // Não bloquear a resposta se houver erro ao melhorar
-          this.logger.warn(
-            'Error improving saldo horas response',
-            improveError.message,
-          );
-        }
-
         this.logger.log('Returning response', {
           hasOutput: !!response.output,
           genericCount: response.output.generic.length,
           hasThreadId: !!response.thread_id,
           hasError,
+          threadId: finalThreadId,
         });
 
         resolve(response);
@@ -2317,6 +2587,7 @@ export class WatsonxService {
    * @param intervalMs - Intervalo entre tentativas em ms (default: 2000)
    * @param timeoutMs - Timeout total em ms (default: 60000)
    * @param onStatus - Callback opcional para eventos de status (thinking/reasoning)
+   * @param lastSentMessageTime - Timestamp da última mensagem do assistente já enviada (opcional)
    */
   private async pollThreadMessages(
     threadId: string,
@@ -2324,6 +2595,7 @@ export class WatsonxService {
     intervalMs: number = 2000,
     timeoutMs: number = 60000,
     onStatus?: StatusCallback,
+    lastSentMessageTime?: number,
   ): Promise<any[]> {
     const startTime = Date.now();
     let seenMessageIds = new Set<string>();
@@ -2331,7 +2603,7 @@ export class WatsonxService {
     let lastMessages: any[] = [];
     let noNewMessagesCount = 0; // Contador de tentativas sem novas mensagens
 
-    this.logger.log('Starting thread polling', {
+    this.logger.log('Starting thread polling (simplified: ID + role only)', {
       threadId,
       maxAttempts,
       intervalMs,
@@ -2349,20 +2621,45 @@ export class WatsonxService {
       }
 
       try {
-        const messages = await this.getThreadMessages(threadId);
-        const currentMessageCount = messages.length;
+        const allMessages = await this.getThreadMessages(threadId);
 
-        // Detectar novas mensagens comparando IDs
-        const newMessages = messages.filter(
-          (msg: any) => msg.id && !seenMessageIds.has(msg.id),
-        );
+        // SIMPLIFICADO: Filtrar apenas por ID e role
+        // Se o ID já foi renderizado, não incluir
+        // Apenas incluir mensagens do assistente (role !== 'user')
+        const newMessages = allMessages.filter((msg: any) => {
+          // Deve ter ID
+          if (!msg.id) {
+            return false;
+          }
 
+          // Se já foi renderizado (está no seenMessageIds), não incluir
+          if (seenMessageIds.has(msg.id)) {
+            return false;
+          }
+
+          // Apenas mensagens do assistente (não incluir mensagens do usuário)
+          if (msg.role === 'user') {
+            return false;
+          }
+
+          return true;
+        });
+
+        // Adicionar novas mensagens ao histórico unificado e ao acumulador
         if (newMessages.length > 0) {
           // Novas mensagens encontradas
           newMessages.forEach((msg: any) => {
             if (msg.id) {
               seenMessageIds.add(msg.id);
             }
+
+            // Adicionar ao histórico unificado (polling)
+            if (threadId && msg.id) {
+              this.addMessageToHistory(threadId, msg, 'polling');
+            }
+
+            // Adicionar à lista acumulada de mensagens do assistente
+            lastMessages.push(msg);
 
             // Capturar flowinstance_id se disponível
             const msgFlowInstanceId =
@@ -2459,7 +2756,11 @@ export class WatsonxService {
             }
           });
 
-          this.logger.debug('New messages', { count: newMessages.length });
+          this.logger.debug('New messages', {
+            count: newMessages.length,
+            totalAccumulated: lastMessages.length,
+            newMessageIds: newMessages.map((m) => m.id),
+          });
 
           noNewMessagesCount = 0; // Reset contador
         } else {
@@ -2467,7 +2768,7 @@ export class WatsonxService {
           noNewMessagesCount++;
           this.logger.debug('No new messages', {
             attempt: attempts + 1,
-            messageCount: currentMessageCount,
+            totalAccumulated: lastMessages.length,
             noNewMessagesCount,
           });
         }
@@ -2475,7 +2776,10 @@ export class WatsonxService {
         // Verificar se devemos parar
         if (noNewMessagesCount >= 2) {
           // 2 tentativas consecutivas sem novas mensagens
-          const lastMessage = messages[messages.length - 1];
+          const lastMessage =
+            lastMessages.length > 0
+              ? lastMessages[lastMessages.length - 1]
+              : null;
           const isStillProcessing =
             lastMessage?.additional_properties?.display_properties?.is_async ===
               true ||
@@ -2491,7 +2795,7 @@ export class WatsonxService {
             : null;
 
           if (!isStillProcessing) {
-            return messages;
+            return lastMessages;
           } else {
             // Ainda processando, continuar
             this.logger.debug('Still processing, continuing polling');
@@ -2499,7 +2803,7 @@ export class WatsonxService {
           }
         }
 
-        lastMessages = messages;
+        // lastMessages já está sendo atualizado incrementalmente acima
 
         // Aguardar antes da próxima tentativa
         if (attempts < maxAttempts - 1) {
@@ -2520,7 +2824,51 @@ export class WatsonxService {
       }
     }
 
-    return lastMessages;
+    // Retornar apenas mensagens novas do histórico unificado (ainda não enviadas)
+    const historyMessages = threadId
+      ? this.getNewHistoryMessages(threadId)
+      : lastMessages;
+
+    this.logger.debug('Retornando mensagens novas do histórico unificado', {
+      threadId,
+      pollingCount: lastMessages.length,
+      newHistoryCount: historyMessages.length,
+    });
+
+    return historyMessages;
+  }
+
+  /**
+   * Extrai o payload da tool do step_history para debug
+   * @param stepHistory - Array de steps da mensagem
+   * @returns Objeto com informações da tool call (nome, args, etc) ou null
+   */
+  private extractToolPayloadFromStepHistory(stepHistory: any[]): any | null {
+    if (!stepHistory || !Array.isArray(stepHistory)) {
+      return null;
+    }
+
+    // Procurar por tool_calls no step_history
+    for (const step of stepHistory) {
+      if (step.step_details && Array.isArray(step.step_details)) {
+        for (const detail of step.step_details) {
+          if (detail.type === 'tool_calls' && detail.tool_calls) {
+            // Retornar informações da primeira tool call encontrada
+            const toolCall = detail.tool_calls[0];
+            if (toolCall) {
+              return {
+                toolName: toolCall.name,
+                toolCallId: toolCall.id,
+                args: toolCall.args,
+                agentDisplayName: detail.agent_display_name,
+              };
+            }
+          }
+        }
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -2687,5 +3035,166 @@ export class WatsonxService {
     }
 
     return null;
+  }
+
+  /**
+   * Adiciona uma mensagem ao histórico unificado
+   * Prioridade: mensagens do run têm prioridade sobre polling
+   * @param threadId - ID do thread
+   * @param message - Mensagem a ser adicionada
+   * @param source - Origem da mensagem ('run' ou 'polling')
+   */
+  private addMessageToHistory(
+    threadId: string,
+    message: any,
+    source: 'run' | 'polling',
+  ): void {
+    if (!threadId || !message || !message.id) {
+      return;
+    }
+
+    // Apenas mensagens do assistente
+    if (message.role !== 'assistant') {
+      return;
+    }
+
+    // Obter ou criar histórico do thread
+    if (!this.conversationHistory.has(threadId)) {
+      this.conversationHistory.set(threadId, new Map());
+    }
+
+    const threadHistory = this.conversationHistory.get(threadId)!;
+    const messageId = message.id;
+
+    // Se a mensagem já existe:
+    // - Se veio do run, sempre sobrescreve (prioridade)
+    // - Se veio do polling, só adiciona se não existir ou se a existente também é do polling
+    const existing = threadHistory.get(messageId);
+    if (existing) {
+      if (source === 'run') {
+        // Run tem prioridade: sempre sobrescreve
+        threadHistory.set(messageId, {
+          message,
+          source,
+          timestamp: Date.now(),
+        });
+        this.logger.debug('Mensagem do run sobrescreveu mensagem do polling', {
+          threadId,
+          messageId,
+        });
+      } else {
+        // Polling: só adiciona se a existente também é do polling (atualiza)
+        if (existing.source === 'polling') {
+          threadHistory.set(messageId, {
+            message,
+            source,
+            timestamp: Date.now(),
+          });
+        } else {
+          // Já existe do run, não sobrescrever
+          this.logger.debug('Mensagem do polling ignorada (já existe do run)', {
+            threadId,
+            messageId,
+          });
+        }
+      }
+    } else {
+      // Nova mensagem: adicionar
+      threadHistory.set(messageId, {
+        message,
+        source,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  /**
+   * Obtém apenas as mensagens novas do histórico (ainda não enviadas ao frontend)
+   * @param threadId - ID do thread
+   * @returns Array de mensagens novas ordenadas
+   */
+  private getNewHistoryMessages(threadId: string): any[] {
+    if (!threadId || !this.conversationHistory.has(threadId)) {
+      return [];
+    }
+
+    // Obter Set de mensagens já enviadas
+    const sentIds = this.sentMessageIds.get(threadId) || new Set<string>();
+
+    const threadHistory = this.conversationHistory.get(threadId)!;
+    const allMessages = Array.from(threadHistory.values())
+      .map((entry) => entry.message)
+      .sort((a, b) => {
+        // Ordenar por created_at se disponível, senão por timestamp do histórico
+        const timeA = a.created_at
+          ? new Date(a.created_at).getTime()
+          : threadHistory.get(a.id)?.timestamp || 0;
+        const timeB = b.created_at
+          ? new Date(b.created_at).getTime()
+          : threadHistory.get(b.id)?.timestamp || 0;
+        return timeA - timeB;
+      });
+
+    // Filtrar apenas mensagens novas (não enviadas)
+    const newMessages = allMessages.filter((msg) => {
+      if (!msg.id) {
+        return false;
+      }
+      return !sentIds.has(msg.id);
+    });
+
+    // Marcar mensagens como enviadas
+    if (newMessages.length > 0) {
+      if (!this.sentMessageIds.has(threadId)) {
+        this.sentMessageIds.set(threadId, new Set());
+      }
+      const sentSet = this.sentMessageIds.get(threadId)!;
+      newMessages.forEach((msg) => {
+        if (msg.id) {
+          sentSet.add(msg.id);
+        }
+      });
+    }
+
+    return newMessages;
+  }
+
+  /**
+   * Obtém todas as mensagens do histórico ordenadas por timestamp (para uso interno)
+   * @param threadId - ID do thread
+   * @returns Array de mensagens ordenadas
+   */
+  private getHistoryMessages(threadId: string): any[] {
+    if (!threadId || !this.conversationHistory.has(threadId)) {
+      return [];
+    }
+
+    const threadHistory = this.conversationHistory.get(threadId)!;
+    const messages = Array.from(threadHistory.values())
+      .map((entry) => entry.message)
+      .sort((a, b) => {
+        // Ordenar por created_at se disponível, senão por timestamp do histórico
+        const timeA = a.created_at
+          ? new Date(a.created_at).getTime()
+          : threadHistory.get(a.id)?.timestamp || 0;
+        const timeB = b.created_at
+          ? new Date(b.created_at).getTime()
+          : threadHistory.get(b.id)?.timestamp || 0;
+        return timeA - timeB;
+      });
+
+    return messages;
+  }
+
+  /**
+   * Limpa o histórico de um thread (útil para limpeza de memória)
+   * @param threadId - ID do thread
+   */
+  private clearThreadHistory(threadId: string): void {
+    if (threadId) {
+      this.conversationHistory.delete(threadId);
+      this.sentMessageIds.delete(threadId);
+      this.logger.debug('Histórico do thread limpo', { threadId });
+    }
   }
 }

@@ -147,6 +147,28 @@ export class WidgetMessageDto {
   @IsOptional()
   @IsString()
   transcribedText?: string;
+
+  @ApiProperty({
+    description: 'Informações de tool call para debug (payload e retorno)',
+    required: false,
+  })
+  @IsOptional()
+  @IsObject()
+  toolInfo?: {
+    toolName?: string;
+    toolCallId?: string;
+    payload?: any; // Args enviados para a tool
+    response?: any; // Resposta recebida da tool
+  };
+
+  @ApiProperty({
+    description: 'Texto de raciocínio/thinking da IA',
+    example: 'Analisando o contexto e planejando a resposta...',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  thinking?: string;
 }
 
 export class WidgetContextDto {

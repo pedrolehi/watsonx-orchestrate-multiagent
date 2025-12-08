@@ -7,6 +7,7 @@ import { CoreService } from '../../core/core.service';
 import { CoreRunDto } from '../../core/dto/core.dto';
 import { StatusEvent } from '../../watsonxorchestrate/tool-status.constants';
 import { SpeechToTextService } from '../../audio/speech-to-text/speech-to-text.service';
+import { WatsonxService } from '../../watsonxorchestrate/watsonx.service';
 import { WidgetAuthDto } from '../dto/widget-auth.dto';
 import {
   WidgetContextDto,
@@ -46,6 +47,7 @@ export class BrokerWidgetService {
     private readonly coreService: CoreService,
     private readonly authService: AuthService,
     private readonly speechToTextService: SpeechToTextService,
+    private readonly watsonxService: WatsonxService,
   ) {}
 
   /**
@@ -435,7 +437,7 @@ export class BrokerWidgetService {
       };
 
       // Padronizar a resposta do Watson independente da estrutura
-      const standardizedData = this.standardizeWatsonResponse(
+      const standardizedData = await this.standardizeWatsonResponse(
         coreResponse.response,
         coreResponse.context,
       );
@@ -629,26 +631,11 @@ export class BrokerWidgetService {
 
     console.log('[BrokerWidgetService] Observable criado e retornado');
 
-    // Fazer subscribe imediatamente para garantir que o Observable comece a emitir
-    // (O NestJS fará seu próprio subscribe, mas isso ajuda a garantir que os eventos sejam emitidos)
-    const testSub = observable.subscribe({
-      next: (value) => {
-        console.log('[BrokerWidgetService] Test subscribe - evento recebido:', {
-          hasData: !!value.data,
-          dataLength: value.data?.length,
-        });
-      },
-      error: (err) => {
-        console.error('[BrokerWidgetService] Test subscribe - erro:', err);
-      },
-      complete: () => {
-        console.log('[BrokerWidgetService] Test subscribe - completado');
-      },
-    });
-
-    // Não fazer unsubscribe - deixar o NestJS gerenciar
-
-    return observable;
+    // IMPORTANTE: Usar shareReplay para compartilhar o Observable entre múltiplos subscribers
+    // Isso evita que executeWithStatusEvents seja executado múltiplas vezes
+    // Cada subscribe em um Observable "cold" executa a função de criação novamente
+    // Com shareReplay, o Observable se torna "hot" e compartilha a mesma execução
+    return observable.pipe(shareReplay());
   }
 
   /**
@@ -950,7 +937,7 @@ export class BrokerWidgetService {
       );
 
       // Processar resposta final
-      const standardizedData = this.standardizeWatsonResponse(
+      const standardizedData = await this.standardizeWatsonResponse(
         coreResponse.response,
         coreResponse.context,
       );
@@ -976,6 +963,51 @@ export class BrokerWidgetService {
         // Adicionar texto transcrito na resposta para que o widget possa atualizar a mensagem do usuário
         ...(transcribedText && { transcribedText }),
       };
+
+      // Debug: verificar toolInfo nas mensagens antes de serializar
+      const messagesWithToolInfo = response.messages.filter(
+        (msg) => msg.toolInfo,
+      );
+      if (messagesWithToolInfo.length > 0) {
+        this.logger.debug('Mensagens com toolInfo antes de serializar SSE', {
+          count: messagesWithToolInfo.length,
+          messageIds: messagesWithToolInfo.map((m) => m.messageId),
+          toolInfoDetails: messagesWithToolInfo.map((m) => ({
+            messageId: m.messageId,
+            hasToolInfo: !!m.toolInfo,
+            toolInfoKeys: m.toolInfo ? Object.keys(m.toolInfo) : [],
+            hasPayload: !!m.toolInfo?.payload,
+            hasResponse: !!m.toolInfo?.response,
+          })),
+        });
+
+        // Verificar se toolInfo está no JSON serializado
+        const serialized = JSON.stringify({
+          event: 'response',
+          data: response,
+        });
+        const parsed = JSON.parse(serialized);
+        const serializedMessagesWithToolInfo = parsed.data.messages.filter(
+          (msg: any) => msg.toolInfo,
+        );
+        this.logger.debug('Mensagens com toolInfo após serialização JSON', {
+          count: serializedMessagesWithToolInfo.length,
+          messageIds: serializedMessagesWithToolInfo.map(
+            (m: any) => m.messageId,
+          ),
+          firstMessageToolInfo: serializedMessagesWithToolInfo[0]?.toolInfo
+            ? {
+                hasToolInfo: !!serializedMessagesWithToolInfo[0].toolInfo,
+                toolInfoKeys: Object.keys(
+                  serializedMessagesWithToolInfo[0].toolInfo,
+                ),
+                payloadPreview: JSON.stringify(
+                  serializedMessagesWithToolInfo[0].toolInfo.payload,
+                ).substring(0, 100),
+              }
+            : null,
+        });
+      }
 
       // Emitir resposta final
       const finalEvent = {
@@ -1008,10 +1040,10 @@ export class BrokerWidgetService {
 
   // --- Métodos Auxiliares de Transformação de UI (Mantidos do Legado para compatibilidade com Widget) ---
 
-  private standardizeWatsonResponse(
+  private async standardizeWatsonResponse(
     responseCore: any,
     context: any,
-  ): { messages: WidgetMessageDto[]; updatedVariables: any } {
+  ): Promise<{ messages: WidgetMessageDto[]; updatedVariables: any }> {
     const standardizedMessages: WidgetMessageDto[] = [];
 
     // Estrutura watson dialog responseCore.output.generic
@@ -1022,6 +1054,45 @@ export class BrokerWidgetService {
         hasForms: responseCore.output.generic.some(
           (m: any) => m.response_type === 'forms',
         ),
+      });
+
+      // Criar mapas para rastrear relações entre mensagens
+      const messageStepHistoryMap = new Map<string, any[]>();
+      const messageParentMap = new Map<string, string | null>(); // message_id -> parent_message_id
+
+      // Primeiro, construir os mapas de todas as mensagens
+      responseCore.output.generic.forEach((msg: any) => {
+        let msgStepHistory = msg._step_history || null;
+        let msgParentId: string | null = null;
+        const msgId = msg._message_id || msg.id;
+
+        // Procurar step_history e parent_message_id nos itens de content
+        if (msg.content) {
+          if (Array.isArray(msg.content)) {
+            for (const item of msg.content) {
+              if (item?._step_history && !msgStepHistory) {
+                msgStepHistory = item._step_history;
+              }
+              if (item?._parent_message_id && !msgParentId) {
+                msgParentId = item._parent_message_id;
+              }
+            }
+          } else {
+            if (msg.content._step_history && !msgStepHistory) {
+              msgStepHistory = msg.content._step_history;
+            }
+            if (msg.content._parent_message_id && !msgParentId) {
+              msgParentId = msg.content._parent_message_id;
+            }
+          }
+        }
+
+        if (msgId) {
+          if (msgStepHistory) {
+            messageStepHistoryMap.set(msgId, msgStepHistory);
+          }
+          messageParentMap.set(msgId, msgParentId);
+        }
       });
 
       let i = 0;
@@ -1041,6 +1112,174 @@ export class BrokerWidgetService {
           });
         }
 
+        // Extrair step_history ANTES de processar a mensagem
+        // O step_history pode estar em vários lugares:
+        // 1. message._step_history (adicionado pelo watsonx.service)
+        // 2. message.content[0]._step_history (se content for array)
+        // 3. Em qualquer item de message.content que tenha _step_history
+        let stepHistory = message._step_history || null;
+        let flowInstanceId: string | null = null;
+
+        // Se não encontrou, procurar em todos os itens de content
+        if (!stepHistory && message.content) {
+          if (Array.isArray(message.content)) {
+            // Procurar em todos os itens do array
+            for (const item of message.content) {
+              if (item?._step_history) {
+                stepHistory = item._step_history;
+              }
+              // Também capturar flowInstanceId se disponível
+              if (item?._flow_instance_id) {
+                flowInstanceId = item._flow_instance_id;
+              }
+            }
+          } else if (message.content._step_history) {
+            stepHistory = message.content._step_history;
+          }
+          if (message.content._flow_instance_id) {
+            flowInstanceId = message.content._flow_instance_id;
+          }
+        }
+
+        // Fallback: tentar no context
+        if (!stepHistory && context?.stepHistory) {
+          stepHistory = context.stepHistory;
+        }
+
+        // Verificar se a mensagem menciona uma ferramenta no texto (indicador de resposta de tool)
+        // Exemplos: "The result from the `gep_flow_consulta_saldo_horas` tool", "Error in flow execution"
+        const messageText = message.text || message.content?.[0]?.text || '';
+        const mentionsTool = this.messageMentionsTool(messageText);
+
+        // Detectar mensagens "Tool is processing..." (is_async: true ou texto específico)
+        let isAsyncToolProcessing = false;
+        let skipRender = false;
+
+        // Procurar flags nos itens de content
+        if (message.content) {
+          if (Array.isArray(message.content)) {
+            for (const item of message.content) {
+              if (item?._is_async) {
+                isAsyncToolProcessing = item._is_async;
+              }
+              if (item?._skip_render) {
+                skipRender = item._skip_render;
+              }
+            }
+          } else {
+            if (message.content._is_async) {
+              isAsyncToolProcessing = message.content._is_async;
+            }
+            if (message.content._skip_render) {
+              skipRender = message.content._skip_render;
+            }
+          }
+        }
+
+        // Também verificar pelo texto (fallback)
+        const isToolProcessingText =
+          messageText.includes('Tool is processing') ||
+          messageText.includes('Please wait until the tool completes');
+
+        const isToolProcessingMessage =
+          isAsyncToolProcessing || isToolProcessingText;
+
+        // Se for mensagem "Tool is processing...", extrair flowInstanceId do texto
+        if (isToolProcessingMessage && !flowInstanceId) {
+          const flowInstanceIdMatch = messageText.match(
+            /flow instance ID ([a-f0-9-]+)/i,
+          );
+          if (flowInstanceIdMatch && flowInstanceIdMatch[1]) {
+            flowInstanceId = flowInstanceIdMatch[1];
+            this.logger.debug('FlowInstanceId extraído do texto da mensagem', {
+              flowInstanceId,
+              messageText: messageText.substring(0, 100),
+            });
+          }
+        }
+
+        // Verificar se esta mensagem é descendente (filha, neta, etc.) de uma mensagem que tinha tool_calls
+        // Isso indica que esta mensagem é a resposta da ferramenta
+        let currentMessageId: string | null =
+          message._message_id || message.id || null;
+        let hasAncestorWithToolCalls = false;
+        const visitedIds = new Set<string>(); // Prevenir loops infinitos
+
+        // Rastrear a cadeia de ancestrais até encontrar uma mensagem com tool_calls
+        while (currentMessageId && !visitedIds.has(currentMessageId)) {
+          visitedIds.add(currentMessageId);
+
+          // Verificar se a mensagem atual tinha tool_calls
+          const currentStepHistory =
+            messageStepHistoryMap.get(currentMessageId);
+          if (currentStepHistory && this.hasToolCalls(currentStepHistory)) {
+            hasAncestorWithToolCalls = true;
+            break;
+          }
+
+          // Ir para o próximo ancestral
+          currentMessageId = messageParentMap.get(currentMessageId) || null;
+        }
+
+        // Também verificar o parent direto (para compatibilidade)
+        let directParentId: string | null = null;
+        if (message.content) {
+          if (Array.isArray(message.content)) {
+            for (const item of message.content) {
+              if (item?._parent_message_id) {
+                directParentId = item._parent_message_id;
+                break;
+              }
+            }
+          } else if (message.content._parent_message_id) {
+            directParentId = message.content._parent_message_id;
+          }
+        }
+
+        // Verificar se o parent direto tinha tool_calls
+        let directParentHadToolCalls = false;
+        if (directParentId) {
+          const directParentStepHistory =
+            messageStepHistoryMap.get(directParentId);
+          if (directParentStepHistory) {
+            directParentHadToolCalls = this.hasToolCalls(
+              directParentStepHistory,
+            );
+          }
+        }
+
+        const parentHadToolCalls =
+          hasAncestorWithToolCalls || directParentHadToolCalls;
+
+        // Log para debug
+        if (stepHistory) {
+          this.logger.debug(
+            'Step history encontrado para extração de toolInfo',
+            {
+              messageType: message.response_type,
+              hasStepHistory: !!stepHistory,
+              stepHistoryLength: Array.isArray(stepHistory)
+                ? stepHistory.length
+                : 0,
+              messageKeys: Object.keys(message),
+            },
+          );
+        } else {
+          this.logger.debug('Step history não encontrado', {
+            messageType: message.response_type,
+            hasMessageStepHistory: !!message._step_history,
+            hasContent: !!message.content,
+            isContentArray: Array.isArray(message.content),
+            hasContentStepHistory: !!(
+              message.content &&
+              Array.isArray(message.content) &&
+              message.content[0]?._step_history
+            ),
+            hasContextStepHistory: !!context?.stepHistory,
+            messageKeys: Object.keys(message),
+          });
+        }
+
         const standardizedMessage = this.processMessageByType(
           message,
           i,
@@ -1049,6 +1288,200 @@ export class BrokerWidgetService {
         );
 
         if (standardizedMessage) {
+          // Se skip_render estiver ativo, não adicionar a mensagem
+          if (skipRender) {
+            this.logger.debug('Mensagem ignorada devido a skip_render', {
+              messageText: messageText.substring(0, 100),
+            });
+            i++; // Incrementar manualmente antes do continue
+            continue; // Pula para próxima mensagem
+          }
+
+          // Ignorar mensagens "Tool is processing..." completamente
+          if (isToolProcessingMessage) {
+            this.logger.debug('Mensagem "Tool is processing" ignorada', {
+              messageText: messageText.substring(0, 100),
+            });
+            i++; // Incrementar manualmente antes do continue
+            continue; // Pula para próxima mensagem
+          }
+          // LÓGICA SIMPLIFICADA: Só adicionar toolInfo se:
+          // 1. A mensagem tem tool_response no step_history (resposta direta da ferramenta)
+          // 2. A mensagem tem flowInstanceId (indica que uma ferramenta foi executada)
+          // 3. A mensagem é "Tool is processing..." (is_async: true) - mesmo que ainda não tenha resposta completa
+
+          const hasToolResponse =
+            stepHistory && this.hasToolResponse(stepHistory);
+          // Para mensagens "Tool is processing...", também verificar se tem tool_calls (payload)
+          const hasToolCalls = stepHistory && this.hasToolCalls(stepHistory);
+          const shouldAddToolInfo =
+            hasToolResponse ||
+            hasToolCalls ||
+            flowInstanceId ||
+            isToolProcessingMessage;
+
+          this.logger.debug('Verificando se deve adicionar toolInfo', {
+            hasToolResponse,
+            flowInstanceId,
+            isToolProcessingMessage,
+            shouldAddToolInfo,
+            messageText: messageText.substring(0, 100),
+          });
+
+          if (shouldAddToolInfo) {
+            // Tentar extrair do step_history primeiro (pode ter tool_response ou tool_calls)
+            let toolInfo =
+              (hasToolResponse || hasToolCalls) && stepHistory
+                ? this.extractToolInfoFromStepHistory(stepHistory)
+                : null;
+
+            // IMPORTANTE: Sempre buscar response da flow instance
+            // O step_history não tem o output real, apenas mensagens de texto
+            // O output real vem de tasks[].output.data ou flowInstance.error
+            if (flowInstanceId) {
+              this.logger.debug(
+                'Buscando toolInfo na flow instance (output real)',
+                {
+                  flowInstanceId,
+                  hasToolInfo: !!toolInfo,
+                  hasPayload: !!toolInfo?.payload,
+                  hasResponseFromStepHistory: !!toolInfo?.response,
+                },
+              );
+              const flowInstanceToolInfo =
+                await this.extractToolInfoFromFlowInstance(flowInstanceId);
+              if (flowInstanceToolInfo) {
+                toolInfo = {
+                  toolName: toolInfo?.toolName || flowInstanceToolInfo.toolName,
+                  toolCallId:
+                    toolInfo?.toolCallId || flowInstanceToolInfo.toolCallId,
+                  payload: toolInfo?.payload || flowInstanceToolInfo.payload,
+                  response: flowInstanceToolInfo.response,
+                };
+                this.logger.debug(
+                  'ToolInfo atualizado com dados da flow instance',
+                  {
+                    hasPayload: !!toolInfo.payload,
+                    hasResponse: !!toolInfo.response,
+                    responseSource: flowInstanceToolInfo.response
+                      ? 'flow_instance'
+                      : 'step_history',
+                  },
+                );
+              }
+            }
+
+            // Adicionar toolInfo se:
+            // 1. Tiver payload OU response (resposta completa)
+            // 2. OU for mensagem "Tool is processing..." e tiver pelo menos o payload (ainda processando)
+            if (toolInfo) {
+              const hasPayloadOrResponse =
+                toolInfo.payload || toolInfo.response;
+              const isProcessingWithPayload =
+                isToolProcessingMessage && toolInfo.payload;
+
+              this.logger.debug(
+                'Verificando condições para adicionar toolInfo',
+                {
+                  hasToolInfo: !!toolInfo,
+                  hasPayload: !!toolInfo.payload,
+                  hasResponse: !!toolInfo.response,
+                  hasPayloadOrResponse,
+                  isProcessingWithPayload,
+                  isToolProcessingMessage,
+                  shouldAdd: hasPayloadOrResponse || isProcessingWithPayload,
+                },
+              );
+
+              if (hasPayloadOrResponse || isProcessingWithPayload) {
+                this.logger.debug('ToolInfo adicionado à mensagem', {
+                  toolName: toolInfo.toolName,
+                  hasPayload: !!toolInfo.payload,
+                  hasResponse: !!toolInfo.response,
+                  source: hasToolResponse ? 'step_history' : 'flow_instance',
+                  isToolProcessing: isToolProcessingMessage,
+                  toolInfoPayload: toolInfo.payload
+                    ? JSON.stringify(toolInfo.payload).substring(0, 100)
+                    : 'null',
+                });
+                standardizedMessage.toolInfo = toolInfo;
+                // Log adicional para debug
+                this.logger.debug('ToolInfo serializado na mensagem', {
+                  messageId: standardizedMessage.messageId,
+                  hasToolInfo: !!standardizedMessage.toolInfo,
+                  toolInfoKeys: standardizedMessage.toolInfo
+                    ? Object.keys(standardizedMessage.toolInfo)
+                    : [],
+                });
+              } else {
+                this.logger.debug(
+                  'ToolInfo NÃO adicionado - condições não satisfeitas',
+                  {
+                    hasPayload: !!toolInfo.payload,
+                    hasResponse: !!toolInfo.response,
+                    isToolProcessingMessage,
+                  },
+                );
+              }
+            } else {
+              this.logger.debug('ToolInfo é null - não pode adicionar', {
+                hasToolResponse,
+                hasToolCalls,
+                flowInstanceId,
+                isToolProcessingMessage,
+              });
+            }
+
+            // Se for "Tool is processing..." mas não conseguiu extrair toolInfo ainda,
+            // tentar buscar o payload e output/error da flow instance
+            if (
+              isToolProcessingMessage &&
+              flowInstanceId &&
+              !standardizedMessage.toolInfo
+            ) {
+              this.logger.debug(
+                'Tentando buscar toolInfo para mensagem "Tool is processing..."',
+                { flowInstanceId },
+              );
+              const flowInstanceToolInfo =
+                await this.extractToolInfoFromFlowInstance(flowInstanceId);
+              if (flowInstanceToolInfo && flowInstanceToolInfo.payload) {
+                standardizedMessage.toolInfo = {
+                  toolName: flowInstanceToolInfo.toolName,
+                  payload: flowInstanceToolInfo.payload,
+                  // response pode ser output ou error
+                  response: flowInstanceToolInfo.response || undefined,
+                };
+                this.logger.debug(
+                  'ToolInfo adicionado para "Tool is processing..."',
+                  {
+                    toolName: flowInstanceToolInfo.toolName,
+                    hasPayload: !!flowInstanceToolInfo.payload,
+                    hasResponse: !!flowInstanceToolInfo.response,
+                  },
+                );
+              }
+            }
+          }
+
+          // Debug: verificar toolInfo antes de adicionar ao array
+          if (standardizedMessage.toolInfo) {
+            this.logger.debug(
+              'Mensagem com toolInfo sendo adicionada ao array',
+              {
+                messageId: standardizedMessage.messageId,
+                message: standardizedMessage.message?.substring(0, 50),
+                hasToolInfo: !!standardizedMessage.toolInfo,
+                toolInfoKeys: Object.keys(standardizedMessage.toolInfo),
+                toolInfoPayload: standardizedMessage.toolInfo.payload
+                  ? JSON.stringify(
+                      standardizedMessage.toolInfo.payload,
+                    ).substring(0, 100)
+                  : 'null',
+              },
+            );
+          }
+
           standardizedMessages.push(standardizedMessage);
 
           // Lógica de look-ahead para combinar mensagens (Option + Text, etc)
@@ -1161,6 +1594,34 @@ export class BrokerWidgetService {
     const normalizedText = this.normalizeNewlines(message.text);
     const nextMessage = messages[index + 1];
 
+    // Extrair toolInfo do step_history se disponível
+    // O step_history pode estar em message._step_history (adicionado pelo watsonx.service)
+    let stepHistory = message._step_history || null;
+    if (!stepHistory && context?.stepHistory) {
+      stepHistory = context.stepHistory;
+    }
+    const toolInfo = stepHistory
+      ? this.extractToolInfoFromStepHistory(stepHistory)
+      : null;
+
+    // Extrair thinking/reasoning se disponível
+    // O thinking pode estar em message._thinking (adicionado pelo watsonx.service)
+    let thinking = message._thinking || null;
+    if (!thinking && context?.thinking) {
+      thinking = context.thinking;
+    }
+    // Se thinking for array, pegar o último item ou concatenar
+    if (Array.isArray(thinking) && thinking.length > 0) {
+      thinking = thinking[thinking.length - 1];
+    }
+    // Se thinking for objeto, extrair text ou content
+    if (thinking && typeof thinking === 'object') {
+      thinking = thinking.text || thinking.content || thinking;
+    }
+    // Garantir que seja string ou null
+    thinking =
+      typeof thinking === 'string' && thinking.trim() ? thinking.trim() : null;
+
     const shouldRenderDatepicker =
       context?.calendario === true ||
       context?.skills?.['actions skill']?.skill_variables?.calendario === true;
@@ -1179,6 +1640,10 @@ export class BrokerWidgetService {
         options: { mode: 'month-year', constraints: constraints },
         messageId: randomUUID(),
         timestamp: new Date().toISOString(),
+        // Adicionar toolInfo se disponível
+        ...(toolInfo && { toolInfo }),
+        // Adicionar thinking se disponível
+        ...(thinking && { thinking }),
       };
     }
 
@@ -1192,6 +1657,8 @@ export class BrokerWidgetService {
         options: { constraints: constraints },
         messageId: randomUUID(),
         timestamp: new Date().toISOString(),
+        // Adicionar toolInfo se disponível
+        ...(toolInfo && { toolInfo }),
       };
     }
 
@@ -1215,6 +1682,10 @@ export class BrokerWidgetService {
           options: this.extractButtons(options),
           messageId: randomUUID(),
           timestamp: new Date().toISOString(),
+          // Adicionar toolInfo se disponível
+          ...(toolInfo && { toolInfo }),
+          // Adicionar thinking se disponível
+          ...(thinking && { thinking }),
         };
       }
 
@@ -1230,6 +1701,8 @@ export class BrokerWidgetService {
           buttons: this.extractButtons(nextMessage.options),
           messageId: randomUUID(),
           timestamp: new Date().toISOString(),
+          // Adicionar toolInfo se disponível
+          ...(toolInfo && { toolInfo }),
         };
       }
     }
@@ -1239,6 +1712,10 @@ export class BrokerWidgetService {
       message: normalizedText,
       messageId: randomUUID(),
       timestamp: new Date().toISOString(),
+      // Adicionar toolInfo se disponível
+      ...(toolInfo && { toolInfo }),
+      // Adicionar thinking se disponível
+      ...(thinking && { thinking }),
     };
   }
 
@@ -1516,6 +1993,434 @@ export class BrokerWidgetService {
         fileType: option.fileType,
       };
     });
+  }
+
+  /**
+   * Verifica se o texto da mensagem menciona uma ferramenta
+   * Isso ajuda a identificar mensagens de resposta de tool mesmo quando step_history está vazio
+   */
+  private messageMentionsTool(text: string): boolean {
+    if (!text) return false;
+
+    const toolIndicators = [
+      /result from the.*tool/i,
+      /error in flow execution/i,
+      /flow.*failed/i,
+      /tool.*result/i,
+      /tool.*error/i,
+      /flow.*error/i,
+    ];
+
+    return toolIndicators.some((pattern) => pattern.test(text));
+  }
+
+  /**
+   * Verifica se o step_history contém tool_calls (chamada de ferramenta)
+   * Isso indica que há um payload disponível, mesmo que ainda não tenha resposta
+   */
+  private hasToolCalls(stepHistory: any[]): boolean {
+    if (!stepHistory || !Array.isArray(stepHistory)) {
+      return false;
+    }
+
+    for (const step of stepHistory) {
+      if (step.step_details && Array.isArray(step.step_details)) {
+        for (const detail of step.step_details) {
+          if (detail.type === 'tool_calls' && detail.tool_calls) {
+            return true;
+          }
+          // Verificar tool_calls diretamente no detail
+          if (detail.tool_calls) {
+            return true;
+          }
+        }
+      }
+      // Verificar diretamente no step
+      if (step.tool_calls) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Verifica se o step_history contém uma resposta de ferramenta (tool_response)
+   * Isso indica que esta mensagem foi gerada APÓS a execução da ferramenta
+   */
+  private hasToolResponse(stepHistory: any[]): boolean {
+    if (!stepHistory || !Array.isArray(stepHistory)) {
+      return false;
+    }
+
+    for (const step of stepHistory) {
+      if (step.step_details && Array.isArray(step.step_details)) {
+        for (const detail of step.step_details) {
+          // Se encontrou tool_response, esta mensagem contém a resposta da ferramenta
+          if (detail.type === 'tool_response') {
+            return true;
+          }
+          // Também verificar tool_output diretamente
+          if (detail.tool_output) {
+            return true;
+          }
+        }
+      }
+      // Verificar diretamente no step
+      if (step.tool_output) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Extrai informações de tool call (payload e resposta) do step_history
+   * IMPORTANTE: Só deve ser chamado para mensagens que contêm tool_response
+   * @param stepHistory - Array de steps da mensagem
+   * @returns Objeto com toolName, toolCallId, payload (args) e response (tool_output)
+   */
+  private extractToolInfoFromStepHistory(stepHistory: any[]): {
+    toolName?: string;
+    toolCallId?: string;
+    payload?: any;
+    response?: any;
+  } | null {
+    if (!stepHistory || !Array.isArray(stepHistory)) {
+      return null;
+    }
+
+    // Procurar por tool_calls e tool_response no step_history
+    let toolCall: any = null;
+    let toolResponse: any = null;
+
+    for (const step of stepHistory) {
+      if (step.step_details && Array.isArray(step.step_details)) {
+        for (const detail of step.step_details) {
+          // Encontrar tool call
+          if (detail.type === 'tool_calls' && detail.tool_calls) {
+            const firstToolCall = detail.tool_calls[0];
+            if (firstToolCall) {
+              toolCall = {
+                toolName: firstToolCall.name,
+                toolCallId: firstToolCall.id,
+                payload: firstToolCall.args,
+              };
+            }
+          }
+        }
+      }
+
+      // Não verificar tool_output no step - o output real vem da flow instance
+      if (step.tool_calls && !toolCall) {
+        const firstToolCall = Array.isArray(step.tool_calls)
+          ? step.tool_calls[0]
+          : step.tool_calls;
+        if (firstToolCall) {
+          toolCall = {
+            toolName: firstToolCall.name || firstToolCall.tool_name,
+            toolCallId: firstToolCall.id || firstToolCall.tool_call_id,
+            payload:
+              firstToolCall.args ||
+              firstToolCall.arguments ||
+              firstToolCall.payload,
+          };
+        }
+      }
+    }
+
+    // IMPORTANTE: Retornar toolInfo se houver tool_calls (pelo menos o payload)
+    // O response pode ser null se ainda está processando (será buscado da flow instance depois)
+    if (toolCall) {
+      return {
+        toolName: toolCall.toolName,
+        toolCallId: toolCall.toolCallId,
+        payload: toolCall.payload,
+        response: toolResponse || undefined, // Pode ser undefined se ainda está processando
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * Extrai informações de tool (payload e retorno) da flow instance
+   * Busca nas tasks da flow instance quando o step_history não tem informações completas
+   */
+  private async extractToolInfoFromFlowInstance(
+    flowInstanceId: string,
+  ): Promise<{
+    toolName?: string;
+    toolCallId?: string;
+    payload?: any;
+    response?: any;
+  } | null> {
+    try {
+      const flowInstance =
+        await this.watsonxService.getFlowInstanceDetails(flowInstanceId);
+
+      if (!flowInstance) {
+        return null;
+      }
+
+      // INPUT: Sempre pegar do nível raiz da flow instance
+      const payload = flowInstance.input || {};
+
+      // OUTPUT/ERROR: Priorizar nível raiz, depois tasks
+      let response: any = null;
+      let toolName: string | null = flowInstance.name || null;
+
+      // Se houver error no nível raiz, usar ele como response
+      if (flowInstance.error) {
+        try {
+          // O error pode ser uma string JSON ou objeto
+          const errorObj =
+            typeof flowInstance.error === 'string'
+              ? JSON.parse(flowInstance.error)
+              : flowInstance.error;
+          response = errorObj;
+        } catch {
+          // Se não for JSON válido, usar como string
+          response = { error: flowInstance.error };
+        }
+      }
+      // Se houver output no nível raiz e não for vazio, usar ele
+      else if (
+        flowInstance.output &&
+        Object.keys(flowInstance.output).length > 0
+      ) {
+        response = flowInstance.output;
+      }
+      // Caso contrário, procurar nas tasks por uma task de tool
+      else if (flowInstance.tasks && Array.isArray(flowInstance.tasks)) {
+        for (const task of flowInstance.tasks) {
+          // Procurar por tasks que são tools (geralmente têm name que corresponde ao nome da tool)
+          // Tasks de tool geralmente têm input e output com os dados completos
+          if (
+            task.state === 'completed' &&
+            task.output &&
+            task.output.data &&
+            (task.output.data.status !== undefined ||
+              task.output.data.info !== undefined ||
+              task.output.data.error !== undefined ||
+              task.output.data.saldo_anterior !== undefined ||
+              task.output.data.saldo_atual !== undefined)
+          ) {
+            toolName = task.name || toolName;
+            response = task.output.data;
+            // Se a task tiver input específico, usar ele (senão usar o input da flow instance)
+            if (task.input && Object.keys(task.input).length > 0) {
+              return {
+                toolName: toolName ? toolName : undefined,
+                payload: task.input,
+                response,
+              };
+            }
+            break;
+          }
+          // Se a task tiver error, usar ele
+          if (task.error) {
+            toolName = task.name || toolName;
+            try {
+              const errorObj =
+                typeof task.error === 'string'
+                  ? JSON.parse(task.error)
+                  : task.error;
+              response = errorObj;
+            } catch {
+              response = { error: task.error } as any;
+            }
+            break;
+          }
+        }
+      }
+
+      // Retornar mesmo se só tiver payload (para mensagens "Tool is processing...")
+      // O response pode ser null se ainda está processando
+      return {
+        toolName: toolName ?? undefined,
+        payload: Object.keys(payload).length > 0 ? payload : undefined,
+        response: response ?? undefined,
+      };
+    } catch (error) {
+      this.logger.warn('Erro ao buscar flow instance para toolInfo', {
+        flowInstanceId,
+        error: error.message,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Extrai flowInstanceId de uma mensagem (pode estar em diferentes lugares)
+   */
+  private extractFlowInstanceIdFromMessage(
+    msg: WidgetMessageDto,
+  ): string | null {
+    // Verificar se está no texto da mensagem (formato "Tool is processing... flow instance ID xxx")
+    if (msg.message) {
+      const match = msg.message.match(/flow instance ID\s+([a-f0-9-]+)/i);
+      if (match && match[1]) {
+        return match[1];
+      }
+    }
+    // Verificar se toolInfo tem alguma referência (pode estar em payload ou response)
+    if (msg.toolInfo?.payload) {
+      const payloadStr = JSON.stringify(msg.toolInfo.payload);
+      const match = payloadStr.match(
+        /flow[_-]?instance[_-]?id["\s:]+([a-f0-9-]+)/i,
+      );
+      if (match && match[1]) {
+        return match[1];
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Faz polling da flow instance para atualizar toolInfo em tempo real
+   * Envia atualizações via SSE quando detectar mudanças no output ou error
+   */
+  private async pollFlowInstanceForToolInfo(
+    flowInstanceId: string,
+    messageId: string,
+    subject: Subject<MessageEvent>,
+  ): Promise<void> {
+    const maxAttempts = 30; // Máximo de 30 tentativas (5 minutos com intervalo de 10s)
+    const pollInterval = 10000; // 10 segundos entre tentativas
+    let lastToolInfo: any = null;
+    let attempts = 0;
+
+    this.logger.debug(
+      'Iniciando polling da flow instance para atualizar toolInfo',
+      {
+        flowInstanceId,
+        messageId,
+        maxAttempts,
+        pollInterval,
+      },
+    );
+
+    while (attempts < maxAttempts) {
+      try {
+        await new Promise((resolve) => setTimeout(resolve, pollInterval));
+        attempts++;
+
+        const flowInstance =
+          await this.watsonxService.getFlowInstanceDetails(flowInstanceId);
+
+        if (!flowInstance) {
+          this.logger.debug(
+            'Flow instance não encontrada, continuando polling',
+            {
+              flowInstanceId,
+              attempt: attempts,
+            },
+          );
+          continue;
+        }
+
+        // Extrair toolInfo atualizado da flow instance
+        const updatedToolInfo =
+          await this.extractToolInfoFromFlowInstance(flowInstanceId);
+
+        if (!updatedToolInfo) {
+          this.logger.debug(
+            'Não foi possível extrair toolInfo da flow instance',
+            {
+              flowInstanceId,
+              attempt: attempts,
+              state: flowInstance.state,
+            },
+          );
+          continue;
+        }
+
+        // Verificar se houve mudança no toolInfo (especialmente no response)
+        const hasChanged =
+          !lastToolInfo ||
+          JSON.stringify(lastToolInfo.response) !==
+            JSON.stringify(updatedToolInfo.response) ||
+          JSON.stringify(lastToolInfo.payload) !==
+            JSON.stringify(updatedToolInfo.payload);
+
+        if (hasChanged) {
+          this.logger.debug('ToolInfo atualizado detectado, enviando via SSE', {
+            flowInstanceId,
+            messageId,
+            attempt: attempts,
+            state: flowInstance.state,
+            hasResponse: !!updatedToolInfo.response,
+            hasPayload: !!updatedToolInfo.payload,
+          });
+
+          // Enviar atualização via SSE
+          const updateEvent = {
+            data: JSON.stringify({
+              event: 'toolInfoUpdate',
+              data: {
+                messageId,
+                toolInfo: updatedToolInfo,
+              },
+            }),
+          } as MessageEvent;
+          subject.next(updateEvent);
+
+          lastToolInfo = updatedToolInfo;
+        }
+
+        // Se a flow instance estiver completa ou falhou, parar o polling
+        if (
+          flowInstance.state === 'completed' ||
+          flowInstance.state === 'failed' ||
+          flowInstance.state === 'error'
+        ) {
+          this.logger.debug('Flow instance finalizada, parando polling', {
+            flowInstanceId,
+            messageId,
+            state: flowInstance.state,
+            finalAttempt: attempts,
+          });
+
+          // Enviar atualização final se ainda não foi enviada
+          if (hasChanged) {
+            const finalUpdateEvent = {
+              data: JSON.stringify({
+                event: 'toolInfoUpdate',
+                data: {
+                  messageId,
+                  toolInfo: updatedToolInfo,
+                  isFinal: true,
+                },
+              }),
+            } as MessageEvent;
+            subject.next(finalUpdateEvent);
+          }
+
+          break;
+        }
+      } catch (error: any) {
+        this.logger.warn('Erro ao fazer polling da flow instance', {
+          flowInstanceId,
+          messageId,
+          attempt: attempts,
+          error: error.message,
+        });
+        // Continuar tentando mesmo em caso de erro
+      }
+    }
+
+    if (attempts >= maxAttempts) {
+      this.logger.warn(
+        'Polling da flow instance atingiu limite de tentativas',
+        {
+          flowInstanceId,
+          messageId,
+          attempts,
+        },
+      );
+    }
   }
 
   private buildDateConstraints(context: any): any {
