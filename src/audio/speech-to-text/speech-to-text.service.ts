@@ -132,6 +132,21 @@ export class SpeechToTextService {
         this.configService.get<string>('SPEECH_TO_TEXT_MULTILINGUAL') !==
         'false'; // Habilitado por padrão
 
+      // Configurações para lidar com silêncios longos
+      // inactivity_timeout: tempo de inatividade (silêncio) em segundos antes de considerar fim do áudio
+      // Valores recomendados: 30-300 segundos (padrão: 30)
+      // Para pausas longas, aumentar este valor
+      const inactivityTimeout =
+        this.configService.get<number>('SPEECH_TO_TEXT_INACTIVITY_TIMEOUT') ||
+        300; // 5 minutos por padrão para suportar pausas longas
+
+      // end_of_phrase_silence_time: tempo de silêncio para considerar fim de frase (em segundos)
+      // Valores recomendados: 0.4-3.0 segundos (padrão: 0.4)
+      const endOfPhraseSilenceTime =
+        this.configService.get<number>(
+          'SPEECH_TO_TEXT_END_OF_PHRASE_SILENCE_TIME',
+        ) || 2.5; // 2.5 segundos para tolerar pausas longas entre frases
+
       const baseParams: any = {
         audio: finalAudioBuffer,
         contentType: finalContentType,
@@ -140,6 +155,9 @@ export class SpeechToTextService {
         profanityFilter: false,
         timestamps: true,
         wordConfidence: true,
+        inactivityTimeout: inactivityTimeout, // Suporta silêncios longos (até 5 minutos)
+        endOfPhraseSilenceTime: endOfPhraseSilenceTime, // Tolerância para pausas entre frases
+        splitTranscriptAtPhraseEnd: true, // Divide transcrição em frases quando há silêncio
       };
 
       // Adicionar customization_id se configurado
