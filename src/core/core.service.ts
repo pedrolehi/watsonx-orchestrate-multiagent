@@ -5,6 +5,9 @@ import {
   StatusCallback,
 } from '../watsonxorchestrate/watsonx.service';
 import { StatusEvent } from '../watsonxorchestrate/tool-status.constants';
+import { PersistenceService } from '../database/session/persistence.service';
+import { extractCollaboratorFromStepHistory } from '../database/session/collaborator-extractor.helper';
+import { randomUUID } from 'crypto';
 
 @Injectable()
 export class CoreService {
@@ -14,7 +17,10 @@ export class CoreService {
   // O widget controla a sessão, o backend controla o thread do Watson Orchestrate
   private readonly sessionThreadMap = new Map<string, string>();
 
-  constructor(private readonly watsonxService: WatsonxService) {}
+  constructor(
+    private readonly watsonxService: WatsonxService,
+    private readonly persistenceService: PersistenceService,
+  ) {}
 
   /**
    * Verifica se uma sessão já tem um thread mapeado
@@ -239,6 +245,191 @@ export class CoreService {
         );
       }
 
+      // Extrair userId (CPF criptografado) do contexto
+      // Usar o CPF criptografado diretamente como userId, sem descriptografar
+      const userId =
+        payload.context?.user_info?.DADOS?.CPF ||
+        payload.context?.user_info?.cpf ||
+        null;
+
+      // Extrair step_history da resposta
+      // O step_history pode estar em diferentes lugares na resposta
+      let stepHistory: Array<any> | undefined;
+      if (
+        wxResponse.output?.generic &&
+        Array.isArray(wxResponse.output.generic)
+      ) {
+        // Procurar step_history nas mensagens
+        for (const msg of wxResponse.output.generic) {
+          if (msg._step_history && Array.isArray(msg._step_history)) {
+            stepHistory = msg._step_history;
+            break;
+          }
+          if (msg.content && Array.isArray(msg.content)) {
+            for (const item of msg.content) {
+              if (item._step_history && Array.isArray(item._step_history)) {
+                stepHistory = item._step_history;
+                break;
+              }
+            }
+          }
+        }
+      }
+      // Fallback: tentar diretamente na resposta
+      if (!stepHistory) {
+        stepHistory =
+          wxResponse.step_history || wxResponse.output?.step_history;
+      }
+
+      // Extrair assistente colaborador do step_history
+      const collaboratorInfo = extractCollaboratorFromStepHistory(stepHistory);
+
+      // Salvar/atualizar Session
+      try {
+        await this.persistenceService.saveSession(
+          sessionId,
+          responseThreadId || existingThreadId || '',
+          agentId,
+          userId || undefined,
+          payload.context?.user_info,
+          payload.channel || 'widget',
+        );
+      } catch (error) {
+        this.logger.warn('Erro ao salvar sessão', { error: error.message });
+      }
+
+      // Salvar mensagem única (input + output em um único documento)
+      const messageId =
+        wxResponse.message_id ||
+        wxResponse.output?.generic?.[0]?._message_id ||
+        randomUUID();
+      try {
+        // Extrair toolInfo e ragInfo da resposta
+        const toolInfo = this.extractToolInfo(wxResponse, stepHistory);
+
+        // Log para debug: verificar se tool foi chamada
+        if (toolInfo) {
+          this.logger.debug('Tool detectada e extraída', {
+            toolName: toolInfo.toolName,
+            hasPayload: !!toolInfo.payload,
+            hasResponse: !!toolInfo.response,
+            hasResult: !!toolInfo.result,
+            status: toolInfo.status,
+            resultPreview: toolInfo.result?.substring(0, 200),
+          });
+        } else {
+          this.logger.debug('Nenhuma tool detectada na resposta');
+        }
+
+        const thinking = wxResponse.thinking || wxResponse.output?.thinking;
+
+        // Calcular tempo de resposta (opcional, pode não estar disponível)
+        const requestTimestamp = payload.context?.timestamp
+          ? new Date(payload.context.timestamp).getTime()
+          : Date.now();
+        const responseTime = Date.now() - requestTimestamp;
+
+        // Preparar arrays de mensagens como vêm da thread
+        // Formato da thread: array de objetos com role e content
+        let userMessages: Array<any> = [
+          {
+            role: 'user',
+            content: payload.message.text || '',
+            ...(payload.message.mediaUrl && {
+              mediaUrl: payload.message.mediaUrl,
+            }),
+            ...(payload.message.mimeType && {
+              mimeType: payload.message.mimeType,
+            }),
+          },
+        ];
+
+        // Mensagens do assistente vêm em output.generic (array)
+        // Garantir que sempre temos um array válido, mesmo em caso de erro
+        let assistantMessages: Array<any> = [];
+        if (
+          wxResponse.output?.generic &&
+          Array.isArray(wxResponse.output.generic)
+        ) {
+          assistantMessages = wxResponse.output.generic;
+        } else if (wxResponse.output) {
+          assistantMessages = [wxResponse.output];
+        } else if (wxResponse.error) {
+          // Se houver erro, criar uma mensagem de erro para salvar
+          assistantMessages = [
+            {
+              response_type: 'text',
+              text: `Error: ${wxResponse.error.message || JSON.stringify(wxResponse.error)}`,
+              error: wxResponse.error,
+            },
+          ];
+        } else {
+          // Fallback: usar a resposta completa
+          assistantMessages = [wxResponse];
+        }
+
+        // Validar que temos arrays válidos antes de salvar
+        if (!userMessages || userMessages.length === 0) {
+          this.logger.warn('Tentativa de salvar mensagem sem userMessages', {
+            sessionId,
+            messageId,
+          });
+          // Garantir que temos pelo menos uma mensagem vazia
+          userMessages = [{ role: 'user', content: '' }];
+        }
+
+        if (!assistantMessages || assistantMessages.length === 0) {
+          this.logger.warn(
+            'Tentativa de salvar mensagem sem assistantMessages',
+            {
+              sessionId,
+              messageId,
+              hasOutput: !!wxResponse.output,
+              hasError: !!wxResponse.error,
+            },
+          );
+          // Garantir que temos pelo menos uma mensagem vazia
+          assistantMessages = [{ response_type: 'text', text: '' }];
+        }
+
+        await this.persistenceService.saveMessage(
+          userId || sessionId, // Fallback para sessionId se não houver userId
+          sessionId,
+          responseThreadId || existingThreadId || '',
+          messageId,
+          userMessages, // Array de mensagens do usuário
+          assistantMessages, // Array de mensagens do assistente
+          stepHistory,
+          toolInfo,
+          thinking,
+          payload.context,
+          undefined,
+          agentId,
+          undefined,
+          collaboratorInfo.collaboratorAgentId,
+          collaboratorInfo.collaboratorAgentName,
+          undefined, // parentMessageId
+          responseTime,
+        );
+
+        this.logger.debug('Mensagem salva com sucesso', {
+          sessionId,
+          messageId,
+          userMessagesCount: userMessages.length,
+          assistantMessagesCount: assistantMessages.length,
+          hasError: !!wxResponse.error,
+        });
+      } catch (error) {
+        this.logger.error('Erro ao salvar mensagem', {
+          error: error.message,
+          stack: error.stack,
+          sessionId,
+          messageId,
+          userId: userId || sessionId,
+        });
+        // Não re-lançar o erro para não quebrar o fluxo, mas logar como error
+      }
+
       const context = {
         ...(wxResponse.context || {}),
         ...(responseThreadId && { thread_id: responseThreadId }),
@@ -268,5 +459,192 @@ export class CoreService {
         settings: {},
       };
     }
+  }
+
+  /**
+   * Extrai toolInfo da resposta do Watson Orchestrate
+   */
+  private extractToolInfo(
+    wxResponse: any,
+    stepHistory?: Array<any>,
+  ):
+    | {
+        toolName?: string;
+        toolCallId?: string;
+        payload?: any;
+        response?: any;
+        result?: string; // String do resultado da tool
+        flowInstanceId?: string;
+        status?: 'pending' | 'processing' | 'completed' | 'failed';
+        ragInfo?: {
+          topic?: string;
+          query?: string;
+          source?: string;
+          relevanceScore?: number;
+        };
+      }
+    | undefined {
+    if (!stepHistory || !Array.isArray(stepHistory)) {
+      this.logger.debug(
+        'extractToolInfo: stepHistory não disponível ou não é array',
+      );
+      return undefined;
+    }
+
+    this.logger.debug(
+      'extractToolInfo: Procurando tool_calls no step_history',
+      {
+        stepHistoryLength: stepHistory.length,
+      },
+    );
+
+    // Procurar por tool_calls no step_history
+    for (const step of stepHistory) {
+      if (step.step_details && Array.isArray(step.step_details)) {
+        for (const detail of step.step_details) {
+          if (detail.type === 'tool_calls' && detail.tool_calls) {
+            const toolCall = detail.tool_calls[0];
+            if (toolCall) {
+              this.logger.debug('extractToolInfo: Tool chamada encontrada', {
+                toolName: toolCall.name,
+                toolCallId: toolCall.id,
+                hasArgs: !!toolCall.args,
+              });
+
+              const toolInfo: any = {
+                toolName: toolCall.name,
+                toolCallId: toolCall.id,
+                payload: toolCall.args,
+                status: 'completed',
+              };
+
+              // Procurar por tool_response
+              for (const step2 of stepHistory) {
+                if (step2.step_details && Array.isArray(step2.step_details)) {
+                  for (const detail2 of step2.step_details) {
+                    if (
+                      detail2.type === 'tool_response' &&
+                      detail2.tool_call_id === toolCall.id
+                    ) {
+                      // Extrair response completo (prioridade: result > output > tool_output > content)
+                      toolInfo.response =
+                        detail2.result ||
+                        detail2.output ||
+                        detail2.tool_output ||
+                        detail2.content;
+
+                      // Extrair result como string (prioridade: result > output > tool_output > content)
+                      if (detail2.result) {
+                        toolInfo.result =
+                          typeof detail2.result === 'string'
+                            ? detail2.result
+                            : JSON.stringify(detail2.result);
+                      } else if (detail2.output) {
+                        toolInfo.result =
+                          typeof detail2.output === 'string'
+                            ? detail2.output
+                            : JSON.stringify(detail2.output);
+                      } else if (detail2.tool_output) {
+                        toolInfo.result =
+                          typeof detail2.tool_output === 'string'
+                            ? detail2.tool_output
+                            : JSON.stringify(detail2.tool_output);
+                      } else if (detail2.content) {
+                        // content pode ser a resposta quando não há result/output (ex: "Transferring to - gep_agent")
+                        toolInfo.result =
+                          typeof detail2.content === 'string'
+                            ? detail2.content
+                            : JSON.stringify(detail2.content);
+                      }
+
+                      this.logger.debug(
+                        'extractToolInfo: Tool response encontrada',
+                        {
+                          toolName: toolCall.name,
+                          toolCallId: toolCall.id,
+                          hasResult: !!toolInfo.result,
+                          resultLength: toolInfo.result?.length,
+                          resultPreview: toolInfo.result?.substring(0, 200),
+                          hasResponse: !!toolInfo.response,
+                          hasContent: !!detail2.content,
+                          contentPreview: detail2.content?.substring(0, 200),
+                          responseKeys: Object.keys(detail2),
+                          // Log completo do detail2 para debug
+                          detail2Structure: {
+                            hasResult: !!detail2.result,
+                            hasOutput: !!detail2.output,
+                            hasToolOutput: !!detail2.tool_output,
+                            hasContent: !!detail2.content,
+                            type: detail2.type,
+                          },
+                        },
+                      );
+                      break;
+                    }
+                  }
+                }
+              }
+
+              // Se não encontrou tool_response, a tool pode estar ainda processando
+              if (!toolInfo.response && !toolInfo.result) {
+                toolInfo.status = 'processing';
+                this.logger.debug(
+                  'extractToolInfo: Tool chamada mas sem resposta ainda',
+                  {
+                    toolName: toolCall.name,
+                    toolCallId: toolCall.id,
+                  },
+                );
+              }
+
+              // Verificar se é RAG
+              const isRAG =
+                toolCall.name?.toLowerCase().includes('rag') ||
+                toolCall.name?.toLowerCase().includes('search') ||
+                toolCall.name?.toLowerCase().includes('knowledge') ||
+                toolCall.name?.toLowerCase().includes('retrieval') ||
+                toolCall.name?.toLowerCase().includes('conversational_search');
+
+              if (isRAG && toolInfo.response) {
+                // Extrair tópico do userInput ou response
+                const topic = this.extractRAGTopic(
+                  toolCall.args?.query || toolCall.args?.text,
+                  toolInfo.response,
+                );
+                toolInfo.ragInfo = {
+                  topic,
+                  query: toolCall.args?.query || toolCall.args?.text,
+                  source: toolInfo.response?.source,
+                  relevanceScore: toolInfo.response?.score,
+                };
+              }
+
+              // Procurar flowInstanceId
+              if (toolInfo.response?.flow_instance_id) {
+                toolInfo.flowInstanceId = toolInfo.response.flow_instance_id;
+              }
+
+              return toolInfo;
+            }
+          }
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Extrai tópico/assunto de uma consulta RAG
+   */
+  private extractRAGTopic(query?: string, response?: any): string | undefined {
+    if (query) {
+      // Retornar os primeiros 100 caracteres da query como tópico
+      return query.substring(0, 100);
+    }
+    if (response?.text) {
+      return response.text.substring(0, 100);
+    }
+    return undefined;
   }
 }

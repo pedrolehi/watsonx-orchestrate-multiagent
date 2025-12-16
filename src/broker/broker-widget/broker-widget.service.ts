@@ -1179,7 +1179,11 @@ export class BrokerWidgetService {
         // Também verificar pelo texto (fallback)
         const isToolProcessingText =
           messageText.includes('Tool is processing') ||
-          messageText.includes('Please wait until the tool completes');
+          messageText.includes('Please wait until the tool completes') ||
+          messageText.includes('A new flow has started') ||
+          messageText.includes(
+            'This chat session is currently dedicated to the flow',
+          );
 
         const isToolProcessingMessage =
           isAsyncToolProcessing || isToolProcessingText;

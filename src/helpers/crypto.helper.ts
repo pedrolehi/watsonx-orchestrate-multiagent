@@ -54,3 +54,21 @@ export const decryptValue = async (toDecrypt: string): Promise<string> => {
 
   return decrypted;
 };
+
+/**
+ * Gera hash SHA256 do CPF para uso como userId
+ * O hash é consistente: mesmo CPF sempre gera o mesmo hash
+ * @param cpf CPF do usuário (com ou sem formatação)
+ * @returns Hash SHA256 do CPF em formato hexadecimal
+ */
+export const hashCpf = (cpf: string): string => {
+  if (!cpf) {
+    throw new Error('CPF não pode ser vazio');
+  }
+
+  // Remove formatação (pontos, traços, espaços)
+  const cleanCpf = cpf.replace(/[.\-\s]/g, '');
+
+  // Gera hash SHA256
+  return crypto.createHash('sha256').update(cleanCpf).digest('hex');
+};
