@@ -1148,14 +1148,41 @@ export class BrokerWidgetService {
 
         // Verificar se a mensagem menciona uma ferramenta no texto (indicador de resposta de tool)
         // Exemplos: "The result from the `gep_flow_consulta_saldo_horas` tool", "Error in flow execution"
-        const messageText = message.text || message.content?.[0]?.text || '';
+        // Extrair texto de todos os lugares possíveis
+        let messageText = message.text || '';
+        if (!messageText && message.content) {
+          if (Array.isArray(message.content)) {
+            messageText = message.content
+              .map((item: any) => item?.text || '')
+              .join(' ')
+              .trim();
+          } else if (message.content.text) {
+            messageText = message.content.text;
+          }
+        }
+        messageText = messageText || '';
         const mentionsTool = this.messageMentionsTool(messageText);
 
         // Detectar mensagens "Tool is processing..." (is_async: true ou texto específico)
         let isAsyncToolProcessing = false;
         let skipRender = false;
 
-        // Procurar flags nos itens de content
+        // Verificar em additional_properties.display_properties primeiro (formato padrão do Watson)
+        if (message.additional_properties?.display_properties) {
+          if (
+            message.additional_properties.display_properties.is_async === true
+          ) {
+            isAsyncToolProcessing = true;
+          }
+          if (
+            message.additional_properties.display_properties.skip_render ===
+            true
+          ) {
+            skipRender = true;
+          }
+        }
+
+        // Procurar flags nos itens de content (fallback)
         if (message.content) {
           if (Array.isArray(message.content)) {
             for (const item of message.content) {
@@ -1176,14 +1203,17 @@ export class BrokerWidgetService {
           }
         }
 
-        // Também verificar pelo texto (fallback)
+        // Também verificar pelo texto (fallback) - verificação mais robusta
         const isToolProcessingText =
           messageText.includes('Tool is processing') ||
           messageText.includes('Please wait until the tool completes') ||
           messageText.includes('A new flow has started') ||
+          messageText.includes('new flow has started') ||
           messageText.includes(
             'This chat session is currently dedicated to the flow',
-          );
+          ) ||
+          messageText.includes('chat session is currently dedicated') ||
+          messageText.includes('will resume once the flow is complete');
 
         const isToolProcessingMessage =
           isAsyncToolProcessing || isToolProcessingText;
@@ -1305,6 +1335,10 @@ export class BrokerWidgetService {
           if (isToolProcessingMessage) {
             this.logger.debug('Mensagem "Tool is processing" ignorada', {
               messageText: messageText.substring(0, 100),
+              isAsyncToolProcessing,
+              isToolProcessingText,
+              skipRender,
+              messageId: message._message_id || message.id,
             });
             i++; // Incrementar manualmente antes do continue
             continue; // Pula para próxima mensagem
@@ -1596,6 +1630,8 @@ export class BrokerWidgetService {
 
     // Normaliza quebras de linha escapadas
     const normalizedText = this.normalizeNewlines(message.text);
+    // Limpa formatação markdown incorreta (ex: **## deve ser ##)
+    const cleanedText = this.cleanMarkdownFormatting(normalizedText);
     const nextMessage = messages[index + 1];
 
     // Extrair toolInfo do step_history se disponível
@@ -1639,7 +1675,7 @@ export class BrokerWidgetService {
       if (context?.calendarioMesAno === true) context.calendarioMesAno = false;
       return {
         sender: 'ai',
-        message: normalizedText,
+        message: cleanedText,
         component: 'datepicker',
         options: { mode: 'month-year', constraints: constraints },
         messageId: randomUUID(),
@@ -1656,7 +1692,7 @@ export class BrokerWidgetService {
       if (context?.calendario === true) context.calendario = false;
       return {
         sender: 'ai',
-        message: normalizedText,
+        message: cleanedText,
         component: 'datepicker',
         options: { constraints: constraints },
         messageId: randomUUID(),
@@ -1681,7 +1717,7 @@ export class BrokerWidgetService {
 
         return {
           sender: 'ai',
-          message: normalizedText,
+          message: cleanedText,
           component: componentType,
           options: this.extractButtons(options),
           messageId: randomUUID(),
@@ -1699,9 +1735,7 @@ export class BrokerWidgetService {
           : '';
         return {
           sender: 'ai',
-          message: nextTitle
-            ? `${normalizedText}\n\n${nextTitle}`
-            : normalizedText,
+          message: nextTitle ? `${cleanedText}\n\n${nextTitle}` : cleanedText,
           buttons: this.extractButtons(nextMessage.options),
           messageId: randomUUID(),
           timestamp: new Date().toISOString(),
@@ -1713,7 +1747,7 @@ export class BrokerWidgetService {
 
     return {
       sender: 'ai',
-      message: normalizedText,
+      message: cleanedText,
       messageId: randomUUID(),
       timestamp: new Date().toISOString(),
       // Adicionar toolInfo se disponível
@@ -1971,6 +2005,28 @@ export class BrokerWidgetService {
     if (!text) return '';
     // Converte \\n (escapado) para \n real
     return text.replace(/\\n/g, '\n');
+  }
+
+  /**
+   * Limpa formatação markdown incorreta que pode ser adicionada pelo agente
+   * Corrige problemas como:
+   * - **## Título** -> ## Título (remove negrito de títulos)
+   * - **### Subtítulo** -> ### Subtítulo
+   * - Outros casos similares
+   */
+  private cleanMarkdownFormatting(text: string): string {
+    if (!text) return '';
+
+    // Remove ** ao redor de títulos markdown (##, ###, ####, etc.)
+    // Padrão: **## Texto** -> ## Texto
+    // Também funciona com ###, ####, etc.
+    text = text.replace(/\*\*(\#{1,6}\s+[^\*]+)\*\*/g, '$1');
+
+    // Remove ** ao redor de títulos que começam no início da linha
+    // Padrão: **## Texto** -> ## Texto (quando está no início da linha)
+    text = text.replace(/(^|\n)\*\*(\#{1,6}\s+[^\*]+)\*\*/g, '$1$2');
+
+    return text;
   }
 
   private extractButtons(options: any[]): any[] {
