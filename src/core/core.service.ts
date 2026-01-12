@@ -434,6 +434,8 @@ export class CoreService {
         ...(wxResponse.context || {}),
         ...(responseThreadId && { thread_id: responseThreadId }),
         session_id: sessionId,
+        // Incluir o messageId gerado para sincronização com o frontend
+        _generated_message_id: messageId,
       };
 
       return {

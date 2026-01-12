@@ -1634,6 +1634,11 @@ export class BrokerWidgetService {
     const cleanedText = this.cleanMarkdownFormatting(normalizedText);
     const nextMessage = messages[index + 1];
 
+    // Usar o messageId gerado pelo CoreService (salvo no MongoDB)
+    // ou o _message_id do Watson se disponível
+    // IMPORTANTE: Não usar message.id pois é um índice sequencial (1, 2, 3...) e não um UUID
+    const messageId = context?._generated_message_id || message._message_id || randomUUID();
+
     // Extrair toolInfo do step_history se disponível
     // O step_history pode estar em message._step_history (adicionado pelo watsonx.service)
     let stepHistory = message._step_history || null;
@@ -1678,7 +1683,7 @@ export class BrokerWidgetService {
         message: cleanedText,
         component: 'datepicker',
         options: { mode: 'month-year', constraints: constraints },
-        messageId: randomUUID(),
+        messageId,
         timestamp: new Date().toISOString(),
         // Adicionar toolInfo se disponível
         ...(toolInfo && { toolInfo }),
@@ -1695,7 +1700,7 @@ export class BrokerWidgetService {
         message: cleanedText,
         component: 'datepicker',
         options: { constraints: constraints },
-        messageId: randomUUID(),
+        messageId,
         timestamp: new Date().toISOString(),
         // Adicionar toolInfo se disponível
         ...(toolInfo && { toolInfo }),
@@ -1720,7 +1725,7 @@ export class BrokerWidgetService {
           message: cleanedText,
           component: componentType,
           options: this.extractButtons(options),
-          messageId: randomUUID(),
+          messageId,
           timestamp: new Date().toISOString(),
           // Adicionar toolInfo se disponível
           ...(toolInfo && { toolInfo }),
@@ -1737,7 +1742,7 @@ export class BrokerWidgetService {
           sender: 'ai',
           message: nextTitle ? `${cleanedText}\n\n${nextTitle}` : cleanedText,
           buttons: this.extractButtons(nextMessage.options),
-          messageId: randomUUID(),
+          messageId,
           timestamp: new Date().toISOString(),
           // Adicionar toolInfo se disponível
           ...(toolInfo && { toolInfo }),
@@ -1748,7 +1753,7 @@ export class BrokerWidgetService {
     return {
       sender: 'ai',
       message: cleanedText,
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
       // Adicionar toolInfo se disponível
       ...(toolInfo && { toolInfo }),
@@ -1762,6 +1767,9 @@ export class BrokerWidgetService {
     context: any,
   ): WidgetMessageDto | null {
     const isMultiselect = context?.multiselect === true;
+    // Usar o messageId gerado pelo CoreService ou _message_id do Watson
+    // IMPORTANTE: Não usar message.id pois é um índice sequencial
+    const messageId = context?._generated_message_id || message._message_id || randomUUID();
 
     if (!isMultiselect && (!message.options || message.options.length === 0))
       return null;
@@ -1779,7 +1787,7 @@ export class BrokerWidgetService {
         component: componentType,
         title: finalTitle,
         options: this.extractButtons(options),
-        messageId: randomUUID(),
+        messageId,
         timestamp: new Date().toISOString(),
       };
     }
@@ -1790,12 +1798,14 @@ export class BrokerWidgetService {
         message.title || message.text || 'Selecione uma opção:',
       ),
       buttons: this.extractButtons(message.options),
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
 
   private processImageMessage(message: any): any {
+    // IMPORTANTE: Não usar message.id pois é um índice sequencial
+    const messageId = message._message_id || randomUUID();
     return {
       sender: 'ai',
       image: {
@@ -1803,12 +1813,14 @@ export class BrokerWidgetService {
         title: message.title,
         alt: message.description,
       },
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
 
   private processVideoMessage(message: any): any {
+    // IMPORTANTE: Não usar message.id pois é um índice sequencial
+    const messageId = message._message_id || randomUUID();
     return {
       sender: 'ai',
       message: this.normalizeNewlines(message.text || 'Vídeo'),
@@ -1818,7 +1830,7 @@ export class BrokerWidgetService {
         description:
           message.description || message.videoDetails?.description || '',
       },
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
@@ -1829,6 +1841,8 @@ export class BrokerWidgetService {
    * O campo 'name' é importante - deve ser enviado de volta ao fazer upload
    */
   private processFileUploadMessage(message: any): any {
+    // IMPORTANTE: Não usar message.id pois é um índice sequencial
+    const messageId = message._message_id || randomUUID();
     return {
       sender: 'ai',
       message: this.normalizeNewlines(
@@ -1840,12 +1854,14 @@ export class BrokerWidgetService {
         name: message.name, // Nome do campo de upload - IMPORTANTE para resposta
         uploadFieldName: message.name, // Alias para facilitar uso no widget
       },
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
 
   private processDateMessage(message: any): any {
+    // IMPORTANTE: Não usar message.id pois é um índice sequencial
+    const messageId = message._message_id || randomUUID();
     return {
       sender: 'ai',
       message: this.normalizeNewlines(
@@ -1857,7 +1873,7 @@ export class BrokerWidgetService {
         name: message.name,
         constraints: {}, // Pode ser expandido com constraints do Watson se disponíveis
       },
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
@@ -1882,6 +1898,8 @@ export class BrokerWidgetService {
       return null;
     }
 
+    // IMPORTANTE: Não usar message.id pois é um índice sequencial
+    const messageId = message._message_id || randomUUID();
     return {
       sender: 'ai',
       message:
@@ -1893,33 +1911,37 @@ export class BrokerWidgetService {
         ui_schema: message.ui_schema,
         form_data: message.form_data || {},
       },
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
 
   private processText(output: any, context: any): any {
-    // Simplificado: reutilizando lógica similar se necessário, ou retornando simples
+    // IMPORTANTE: Não usar output.id pois é um índice sequencial
+    const messageId = context?._generated_message_id || output._message_id || randomUUID();
     return {
       sender: 'ai',
       message: output.content || output.text || '',
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
 
   private processOption(output: any, context: any): any {
-    // Simplificado para actions
+    // IMPORTANTE: Não usar output.id pois é um índice sequencial
+    const messageId = context?._generated_message_id || output._message_id || randomUUID();
     return {
       sender: 'ai',
       message: output.content || 'Selecione uma opção:',
       buttons: this.extractButtons(output.options),
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
 
   private processImage(output: any): any {
+    // IMPORTANTE: Não usar output.id pois é um índice sequencial
+    const messageId = output._message_id || randomUUID();
     return {
       sender: 'ai',
       image: {
@@ -1927,12 +1949,14 @@ export class BrokerWidgetService {
         title: output.title,
         alt: output.description,
       },
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
 
   private processVideo(output: any): any {
+    // IMPORTANTE: Não usar output.id pois é um índice sequencial
+    const messageId = output._message_id || randomUUID();
     return {
       sender: 'ai',
       message: output.content || 'Vídeo',
@@ -1941,12 +1965,14 @@ export class BrokerWidgetService {
         title: output.title,
         description: output.description,
       },
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
 
   private processFileUpload(output: any): any {
+    // IMPORTANTE: Não usar output.id pois é um índice sequencial
+    const messageId = output._message_id || randomUUID();
     return {
       sender: 'ai',
       message: output.text || 'Por favor, envie o arquivo solicitado.',
@@ -1954,12 +1980,14 @@ export class BrokerWidgetService {
       options: {
         name: output.name,
       },
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
 
   private processDate(output: any): any {
+    // IMPORTANTE: Não usar output.id pois é um índice sequencial
+    const messageId = output._message_id || randomUUID();
     return {
       sender: 'ai',
       message: output.text || 'Por favor, selecione uma data.',
@@ -1969,7 +1997,7 @@ export class BrokerWidgetService {
         name: output.name,
         constraints: output.constraints || {},
       },
-      messageId: randomUUID(),
+      messageId,
       timestamp: new Date().toISOString(),
     };
   }
