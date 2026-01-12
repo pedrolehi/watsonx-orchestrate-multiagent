@@ -313,4 +313,106 @@ export class PersistenceService {
         totalSessions > 0 ? totalMessages / totalSessions : 0,
     };
   }
+
+  /**
+   * Atualiza o feedback do usuário em uma mensagem existente
+   * @param messageId - ID da mensagem (campo messageId, não _id)
+   * @param feedback - 'positive', 'negative' ou null para remover
+   */
+  async updateMessageFeedback(
+    messageId: string,
+    feedback: 'positive' | 'negative' | null,
+  ): Promise<MessageDocument | null> {
+    this.logger.log(`Updating feedback for messageId: ${messageId} with ${feedback}`);
+
+    const updateData: Partial<Message> = {
+      userFeedback: feedback,
+      feedbackTimestamp: feedback ? new Date() : undefined,
+    };
+
+    // Se feedback é null, remove o campo feedbackTimestamp
+    if (feedback === null) {
+      const updatedMessage = await this.messageModel
+        .findOneAndUpdate(
+          { messageId },
+          { 
+            $set: { userFeedback: null },
+            $unset: { feedbackTimestamp: 1 }
+          },
+          { new: true },
+        )
+        .exec();
+
+      if (!updatedMessage) {
+        this.logger.warn(`Message not found: ${messageId}`);
+        return null;
+      }
+
+      this.logger.log(`Feedback removed for messageId: ${messageId}`);
+      return updatedMessage;
+    }
+
+    const updatedMessage = await this.messageModel
+      .findOneAndUpdate(
+        { messageId },
+        { $set: updateData },
+        { new: true },
+      )
+      .exec();
+
+    if (!updatedMessage) {
+      this.logger.warn(`Message not found: ${messageId}`);
+      return null;
+    }
+
+    this.logger.log(`Feedback updated successfully for messageId: ${messageId}`);
+    return updatedMessage;
+  }
+
+  /**
+   * Busca uma mensagem pelo messageId
+   */
+  async findMessageByMessageId(messageId: string): Promise<MessageDocument | null> {
+    return await this.messageModel.findOne({ messageId }).exec();
+  }
+
+  /**
+   * Estatísticas de feedback por agente (para analytics)
+   */
+  async getFeedbackStatsByAgent(agentId: string): Promise<{
+    total: number;
+    positive: number;
+    negative: number;
+    noFeedback: number;
+  }> {
+    const stats = await this.messageModel.aggregate([
+      { $match: { agentId } },
+      {
+        $group: {
+          _id: '$userFeedback',
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const result = {
+      total: 0,
+      positive: 0,
+      negative: 0,
+      noFeedback: 0,
+    };
+
+    stats.forEach((stat) => {
+      if (stat._id === 'positive') {
+        result.positive = stat.count;
+      } else if (stat._id === 'negative') {
+        result.negative = stat.count;
+      } else if (stat._id === null) {
+        result.noFeedback = stat.count;
+      }
+      result.total += stat.count;
+    });
+
+    return result;
+  }
 }
