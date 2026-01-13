@@ -315,29 +315,57 @@ export class PersistenceService {
   }
 
   /**
+   * Traduz valores técnicos do frontend para texto legível em português
+   */
+  private translateFeedbackValues(
+    feedbackType: 'positive' | 'negative',
+    reason?: 'incorrect_info' | 'incomplete_info' | 'other' | null,
+  ): { type: string; reason?: string } {
+    const typeMap = {
+      positive: 'Positivo',
+      negative: 'Negativo',
+    };
+
+    const reasonMap = {
+      incorrect_info: 'Informação incorreta',
+      incomplete_info: 'Informação incompleta',
+      other: 'Outros',
+    };
+
+    return {
+      type: typeMap[feedbackType],
+      reason: reason ? reasonMap[reason] : undefined,
+    };
+  }
+
+  /**
    * Atualiza o feedback do usuário em uma mensagem existente
    * @param messageId - ID da mensagem (campo messageId, não _id)
-   * @param feedback - 'positive', 'negative' ou null para remover
+   * @param feedbackType - 'positive', 'negative' ou null para remover
+   * @param reason - Motivo do feedback negativo (opcional)
+   * @param reasonText - Texto adicional para 'other' (opcional)
    */
   async updateMessageFeedback(
     messageId: string,
-    feedback: 'positive' | 'negative' | null,
+    feedbackType: 'positive' | 'negative' | null,
+    reason?: 'incorrect_info' | 'incomplete_info' | 'other' | null,
+    reasonText?: string,
   ): Promise<MessageDocument | null> {
-    this.logger.log(`Updating feedback for messageId: ${messageId} with ${feedback}`);
+    this.logger.log(
+      `Updating feedback for messageId: ${messageId} with ${feedbackType}`,
+      {
+        reason,
+        hasReasonText: !!reasonText,
+      },
+    );
 
-    const updateData: Partial<Message> = {
-      userFeedback: feedback,
-      feedbackTimestamp: feedback ? new Date() : undefined,
-    };
-
-    // Se feedback é null, remove o campo feedbackTimestamp
-    if (feedback === null) {
+    // Se feedback é null, remove o objeto inteiro
+    if (feedbackType === null) {
       const updatedMessage = await this.messageModel
         .findOneAndUpdate(
           { messageId },
-          { 
-            $set: { userFeedback: null },
-            $unset: { feedbackTimestamp: 1 }
+          {
+            $unset: { feedback: 1 },
           },
           { new: true },
         )
@@ -352,10 +380,30 @@ export class PersistenceService {
       return updatedMessage;
     }
 
+    // Traduzir valores para português
+    const translated = this.translateFeedbackValues(feedbackType, reason);
+
+    // Montar objeto de feedback estruturado
+    const feedbackObject: any = {
+      type: translated.type,
+      timestamp: new Date(),
+    };
+
+    // Adicionar reason e comment apenas se fornecidos (feedback negativo)
+    if (feedbackType === 'negative') {
+      if (translated.reason) {
+        feedbackObject.reason = translated.reason;
+      }
+      if (reasonText) {
+        feedbackObject.comment = reasonText;
+      }
+    }
+
+    // Atualizar no banco com o objeto estruturado
     const updatedMessage = await this.messageModel
       .findOneAndUpdate(
         { messageId },
-        { $set: updateData },
+        { $set: { feedback: feedbackObject } },
         { new: true },
       )
       .exec();
@@ -365,7 +413,9 @@ export class PersistenceService {
       return null;
     }
 
-    this.logger.log(`Feedback updated successfully for messageId: ${messageId}`);
+    this.logger.log(
+      `Feedback updated for messageId: ${messageId} - ${translated.type}`,
+    );
     return updatedMessage;
   }
 
@@ -378,6 +428,7 @@ export class PersistenceService {
 
   /**
    * Estatísticas de feedback por agente (para analytics)
+   * Usa a nova estrutura aninhada: feedback.type
    */
   async getFeedbackStatsByAgent(agentId: string): Promise<{
     total: number;
@@ -389,7 +440,7 @@ export class PersistenceService {
       { $match: { agentId } },
       {
         $group: {
-          _id: '$userFeedback',
+          _id: '$feedback.type',
           count: { $sum: 1 },
         },
       },
@@ -403,11 +454,11 @@ export class PersistenceService {
     };
 
     stats.forEach((stat) => {
-      if (stat._id === 'positive') {
+      if (stat._id === 'Positivo') {
         result.positive = stat.count;
-      } else if (stat._id === 'negative') {
+      } else if (stat._id === 'Negativo') {
         result.negative = stat.count;
-      } else if (stat._id === null) {
+      } else if (stat._id === null || stat._id === undefined) {
         result.noFeedback = stat.count;
       }
       result.total += stat.count;
