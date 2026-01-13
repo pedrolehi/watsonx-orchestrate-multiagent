@@ -73,11 +73,16 @@ export class Message {
   @Prop({ type: Number })
   responseTime?: number; // Tempo de resposta em ms
 
-  @Prop({ type: String, enum: ['positive', 'negative', null], default: null })
-  userFeedback?: 'positive' | 'negative' | null; // Feedback do usuário (polegar)
-
-  @Prop({ type: Date })
-  feedbackTimestamp?: Date; // Quando o feedback foi dado
+  @Prop({
+    type: Object,
+    default: null,
+  })
+  feedback?: {
+    type: string; // "Positivo" ou "Negativo"
+    reason?: string; // "Informação incorreta", "Informação incompleta", "Outros"
+    comment?: string; // Texto adicional do usuário
+    timestamp: Date; // Quando o feedback foi dado
+  } | null;
 }
 
 export const MessageSchema = SchemaFactory.createForClass(Message);

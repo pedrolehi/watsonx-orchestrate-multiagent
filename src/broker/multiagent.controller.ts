@@ -29,6 +29,14 @@ class MessageFeedbackDto {
   @IsOptional()
   @IsString()
   timestamp?: string;
+
+  @IsOptional()
+  @IsIn(['incorrect_info', 'incomplete_info', 'other', null])
+  reason?: 'incorrect_info' | 'incomplete_info' | 'other' | null;
+
+  @IsOptional()
+  @IsString()
+  reasonText?: string;
 }
 
 /**
@@ -106,6 +114,8 @@ export class MultiagentController {
       const updatedMessage = await this.persistenceService.updateMessageFeedback(
         messageId,
         body.feedback,
+        body.reason,
+        body.reasonText,
       );
 
       if (!updatedMessage) {
@@ -115,8 +125,7 @@ export class MultiagentController {
       return {
         success: true,
         messageId: updatedMessage.messageId,
-        feedback: updatedMessage.userFeedback,
-        feedbackTimestamp: updatedMessage.feedbackTimestamp,
+        feedback: updatedMessage.feedback || null,
       };
     } catch (error: unknown) {
       const errorMessage =
