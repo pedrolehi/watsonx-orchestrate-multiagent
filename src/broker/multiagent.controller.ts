@@ -16,6 +16,7 @@ import {
 } from '@nestjs/swagger';
 import { IsOptional, IsString, IsIn } from 'class-validator';
 import { PersistenceService } from '../database/session/persistence.service';
+import { EmailService } from '../utils/email.service';
 
 /**
  * DTO para atualização de feedback
@@ -48,7 +49,10 @@ class MessageFeedbackDto {
 export class MultiagentController {
   private readonly logger = new Logger(MultiagentController.name);
 
-  constructor(private readonly persistenceService: PersistenceService) {}
+  constructor(
+    private readonly persistenceService: PersistenceService,
+    private readonly emailService: EmailService,
+  ) {}
 
   /**
    * Atualiza o feedback de uma mensagem específica
@@ -122,6 +126,22 @@ export class MultiagentController {
         throw new NotFoundException(`Mensagem com ID ${messageId} não encontrada`);
       }
 
+      // Fire and forget: Dispara alerta de e-mail para feedback negativo (assíncrono)
+      if (body.feedback === 'negative' && updatedMessage.feedback) {
+        this.sendNegativeFeedbackAlert(
+          messageId,
+          updatedMessage.sessionId,
+          updatedMessage.feedback.reason || 'Não especificado',
+          updatedMessage.feedback.comment,
+          updatedMessage.assistantMessages,
+        ).catch((error) => {
+          // Log do erro, mas não propaga para o cliente
+          this.logger.error(
+            `Falha ao enviar alerta de feedback negativo: ${error.message}`,
+          );
+        });
+      }
+
       return {
         success: true,
         messageId: updatedMessage.messageId,
@@ -134,6 +154,41 @@ export class MultiagentController {
         messageId,
         error: errorMessage,
       });
+      throw error;
+    }
+  }
+
+  /**
+   * Método privado para enviar alerta de feedback negativo
+   * Fire and forget: não bloqueia a resposta HTTP
+   */
+  private async sendNegativeFeedbackAlert(
+    messageId: string,
+    sessionId: string,
+    feedbackReason: string,
+    feedbackComment: string | undefined,
+    assistantMessages: any[],
+  ): Promise<void> {
+    try {
+      // Extrair o conteúdo da última resposta da IA
+      let aiResponse = 'Conteúdo não disponível';
+      if (assistantMessages && assistantMessages.length > 0) {
+        const lastMessage = assistantMessages[assistantMessages.length - 1];
+        aiResponse = lastMessage.text || lastMessage.content || 'Conteúdo não disponível';
+      }
+
+      // Disparar e-mail
+      await this.emailService.sendNegativeFeedbackAlert({
+        messageId,
+        sessionId,
+        aiResponse,
+        feedbackReason,
+        feedbackComment,
+      });
+
+      this.logger.log(`Alerta de feedback negativo enviado para messageId: ${messageId}`);
+    } catch (error) {
+      // Erro já será logado no catch do método chamador
       throw error;
     }
   }
