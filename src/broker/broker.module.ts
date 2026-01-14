@@ -7,6 +7,7 @@ import { TextToSpeechModule } from '../audio/text-to-speech/text-to-speech.modul
 import { SpeechToTextModule } from '../audio/speech-to-text/speech-to-text.module';
 import { AudioCacheModule } from '../audio/audio-cache/audio-cache.module';
 import { PersistenceModule } from '../database/session/persistence.module';
+import { UtilsModule } from '../utils/utils.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { PersistenceModule } from '../database/session/persistence.module';
     SpeechToTextModule,
     AudioCacheModule,
     PersistenceModule,
+    UtilsModule,
   ],
   controllers: [BrokerController, MultiagentController],
 })
