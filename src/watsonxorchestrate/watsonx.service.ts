@@ -65,8 +65,14 @@ export class WatsonxService {
 
     this.logger.log(`Watson Orchestrate baseURL: ${baseURL}`);
 
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:68',message:'Creating axios instance',data:{baseURL},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
     this.axiosInstance = axios.create({
       baseURL,
+      timeout: 60000, // 60 segundos para timeout geral
+      httpAgent: false, // Desabilitar keep-alive para evitar reutilização de socket em estado inválido
+      httpsAgent: false,
     });
 
     // Métodos privados para gerenciar histórico unificado
@@ -76,12 +82,21 @@ export class WatsonxService {
     // Interceptor de REQUEST para adicionar autenticação
     this.axiosInstance.interceptors.request.use(
       async (config) => {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:77',message:'Request interceptor - before auth',data:{url:config.url,method:config.method,hasTimeout:!!config.timeout},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+        // #endregion
         const token = await this.getIamToken();
         config.headers.Authorization = `Bearer ${token}`;
         config.headers['IAM-API_KEY'] = this.apiKey;
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:82',message:'Request interceptor - after auth',data:{url:config.url,method:config.method,hasToken:!!token},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+        // #endregion
         return config;
       },
       (error) => {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:85',message:'Request interceptor error',data:{error:error.message,code:error.code},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+        // #endregion
         this.logger.error('Request error', { message: error.message });
         return Promise.reject(error);
       },
@@ -89,8 +104,16 @@ export class WatsonxService {
 
     // Interceptor de RESPONSE apenas para erros
     this.axiosInstance.interceptors.response.use(
-      (response) => response,
+      (response) => {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:92',message:'Response interceptor - success',data:{url:response.config?.url,status:response.status},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+        // #endregion
+        return response;
+      },
       (error) => {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:94',message:'Response interceptor - error',data:{url:error.config?.url,status:error.response?.status,message:error.message,code:error.code,isECONNRESET:error.code==='ECONNRESET',hasResponse:!!error.response},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'F'})}).catch(()=>{});
+        // #endregion
         this.logger.error('Response error', {
           status: error.response?.status,
           message: error.message,
@@ -547,6 +570,9 @@ export class WatsonxService {
         payload: JSON.stringify(payload),
       });
 
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:573',message:'Before POST /runs with streaming (sendMessageWithFiles)',data:{hasPayload:!!payload,payloadSize:JSON.stringify(payload).length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+      // #endregion
       const response = await this.axiosInstance.post('/runs', payload, {
         params: {
           stream: true,
@@ -560,7 +586,11 @@ export class WatsonxService {
           Connection: 'keep-alive',
         },
         responseType: 'stream',
+        timeout: 60000, // Timeout explícito de 60 segundos
       });
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:587',message:'After POST /runs - response received (sendMessageWithFiles)',data:{status:response.status,hasStream:!!response.data},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
+      // #endregion
 
       // Processar o stream SSE
       return await this.processSSEStream(response.data);
@@ -698,6 +728,9 @@ export class WatsonxService {
         },
       );
 
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:724',message:'Before POST /runs with streaming (runWithStreaming)',data:{hasPayload:!!payload,payloadSize:JSON.stringify(payload).length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'I'})}).catch(()=>{});
+      // #endregion
       const response = await this.axiosInstance.post('/runs', payload, {
         params: {
           stream: true,
@@ -711,7 +744,11 @@ export class WatsonxService {
           Connection: 'keep-alive',
         },
         responseType: 'stream',
+        timeout: 60000, // Timeout explícito de 60 segundos
       });
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/5c73f3f8-c70b-45f0-ba6e-1483b2c0a90a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'watsonx.service.ts:738',message:'After POST /runs - response received (runWithStreaming)',data:{status:response.status,hasStream:!!response.data},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'J'})}).catch(()=>{});
+      // #endregion
 
       // Emitir status inicial
       if (onStatus) {
