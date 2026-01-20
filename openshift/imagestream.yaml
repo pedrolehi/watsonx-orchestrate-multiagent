@@ -1,0 +1,19 @@
+# ImageStream para Multiagent
+# Monitora imagens do Container Registry e permite atualização automática
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: hml-senac-wxorchestrate-multiagent
+  namespace: hml-senac-orquestrator-chatbotx
+spec:
+  lookupPolicy:
+    local: false
+  tags:
+    - name: latest
+      from:
+        kind: DockerImage
+        name: us.icr.io/code-engine-senac-dev/senac-wxorchestrate-multiagent:latest
+      importPolicy:
+        scheduled: true # Faz polling periódico para verificar mudanças (padrão: 15 minutos)
+      referencePolicy:
+        type: Local

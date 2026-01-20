@@ -1,0 +1,50 @@
+name: Build and Push to IBM Container Registry
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "**/*"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: # Permite executar manualmente via GitHub UI
+
+jobs:
+  build-multiagent:
+    name: Build Multiagent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install IBM Cloud CLI
+        run: |
+          curl -fsSL https://clis.cloud.ibm.com/install/linux | sh
+          ibmcloud version
+
+      - name: Install Container Registry plugin
+        run: |
+          ibmcloud plugin install container-registry
+
+      - name: Login to IBM Cloud
+        env:
+          IBMCLOUD_VERSION_CHECK: false
+        run: |
+          ibmcloud login --apikey ${{ secrets.IBM_CLOUD_API_KEY }} -r us-south
+          ibmcloud cr region-set us-south
+          ibmcloud cr login
+
+      - name: Build and push Multiagent image
+        run: |
+          docker build -t us.icr.io/code-engine-senac-dev/senac-wxorchestrate-multiagent:latest \
+                       -t us.icr.io/code-engine-senac-dev/senac-wxorchestrate-multiagent:${{ github.sha }} .
+          docker push us.icr.io/code-engine-senac-dev/senac-wxorchestrate-multiagent:latest
+          docker push us.icr.io/code-engine-senac-dev/senac-wxorchestrate-multiagent:${{ github.sha }}
+
+      - name: Summary
+        run: |
+          echo "✅ Multiagent image pushed successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: us.icr.io/code-engine-senac-dev/senac-wxorchestrate-multiagent:latest" >> $GITHUB_STEP_SUMMARY
+          echo "- SHA: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

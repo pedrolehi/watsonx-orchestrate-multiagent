@@ -1,0 +1,71 @@
+# Deployment para Multiagent
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: hml-senac-wxorchestrate-multiagent
+  namespace: hml-senac-orquestrator-chatbotx
+  labels:
+    app: hml-senac-wxorchestrate-multiagent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hml-senac-wxorchestrate-multiagent
+  template:
+    metadata:
+      labels:
+        app: hml-senac-wxorchestrate-multiagent
+    spec:
+      containers:
+        - name: hml-senac-wxorchestrate-multiagent
+          image: us.icr.io/code-engine-senac-dev/senac-wxorchestrate-multiagent:latest # Referência direta do registry
+          ports:
+            - containerPort: 3000
+              protocol: TCP
+          env:
+            # Configurações da aplicação
+            - name: PORT
+              value: "3000"
+            - name: NODE_ENV
+              value: "production"
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 500m
+              memory: 512Mi
+          imagePullPolicy: Always
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          # Health checks
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext: {}
+      imagePullSecrets:
+        - name: container-registry
+      schedulerName: default-scheduler
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 600
