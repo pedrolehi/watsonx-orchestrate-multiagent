@@ -1,10 +1,10 @@
 kind: Route
 apiVersion: route.openshift.io/v1
 metadata:
-  name: hml-senac-wxorchestrate-multiagent
+  name: hml-senac-agente-orquestrador
   namespace: hml-senac-orquestrator-chatbotx
   labels:
-    app: hml-senac-wxorchestrate-multiagent
+    app: hml-senac-agente-orquestrador
   annotations:
     haproxy.router.openshift.io/timeout: 180s
 spec:
@@ -12,7 +12,7 @@ spec:
   path: /multiagent/api/v1
   to:
     kind: Service
-    name: hml-senac-wxorchestrate-multiagent-service
+    name: hml-senac-agente-orquestrador-service
     weight: 100
   port:
     targetPort: 3000-tcp

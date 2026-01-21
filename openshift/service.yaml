@@ -2,10 +2,10 @@
 kind: Service
 apiVersion: v1
 metadata:
-  name: hml-senac-wxorchestrate-multiagent-service
+  name: hml-senac-agente-orquestrador-service
   namespace: hml-senac-orquestrator-chatbotx
   labels:
-    app: hml-senac-wxorchestrate-multiagent
+    app: hml-senac-agente-orquestrador
 spec:
   ports:
     - name: 3000-tcp
@@ -17,4 +17,4 @@ spec:
   ipFamilyPolicy: SingleStack
   sessionAffinity: None
   selector:
-    app: hml-senac-wxorchestrate-multiagent
+    app: hml-senac-agente-orquestrador

@@ -1,23 +1,22 @@
-# Deployment para Multiagent
 kind: Deployment
 apiVersion: apps/v1
 metadata:
-  name: hml-senac-wxorchestrate-multiagent
+  name: hml-senac-agente-orquestrador
   namespace: hml-senac-orquestrator-chatbotx
   labels:
-    app: hml-senac-wxorchestrate-multiagent
+    app: hml-senac-agente-orquestrador
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: hml-senac-wxorchestrate-multiagent
+      app: hml-senac-agente-orquestrador
   template:
     metadata:
       labels:
-        app: hml-senac-wxorchestrate-multiagent
+        app: hml-senac-agente-orquestrador
     spec:
       containers:
-        - name: hml-senac-wxorchestrate-multiagent
+        - name: hml-senac-agente-orquestrador
           image: us.icr.io/code-engine-senac-dev/senac-wxorchestrate-multiagent:latest # Referência direta do registry
           ports:
             - containerPort: 3000
@@ -28,6 +27,25 @@ spec:
               value: "3000"
             - name: NODE_ENV
               value: "production"
+            # Watson Orchestrate (obrigatórias)
+            - name: ORCHESTRATE_URL
+              value: "https://api.us-south.watson-orchestrate.cloud.ibm.com"
+            - name: ORCHESTRATE_INSTANCE_ID
+              value: "57425687-2372-4567-9f22-59bd22abf670"
+            - name: ORCHESTRATE_API_KEY
+              value: "jcy02VMrCQTb2RdFQxPbsBAGwdmlb-maxLe30O8Rvg1C"
+            # MongoDB
+            - name: MONGODB_URI
+              value: "mongodb://ibm_cloud_9ffbe8b6_5eb1_4954_8256_0c84ab674ebd:2e7964719a0255f91e0c31e38db092d1d606cf5f00dfc8095d0d8260a7f5c7ca@e60618f7-9b54-46d8-98ec-4916dbaffb51-0.br37s45d0p54n73ffbr0.databases.appdomain.cloud:31951,e60618f7-9b54-46d8-98ec-4916dbaffb51-1.br37s45d0p54n73ffbr0.databases.appdomain.cloud:31951,e60618f7-9b54-46d8-98ec-4916dbaffb51-2.br37s45d0p54n73ffbr0.databases.appdomain.cloud:31951/multiagent?authSource=admin&replicaSet=replset&tls=true&tlsInsecure=true"
+            # Keycloak (opcional - para autenticação)
+            - name: KEYCLOAK_URL
+              value: "https://hom-iam.sp.senac.br/auth"
+            - name: KEYCLOAK_REALM
+              value: "local"
+            - name: KEYCLOAK_CLIENT_ID
+              value: "4000"
+            - name: KEYCLOAK_CLIENT_SECRET
+              value: "sNS5deWWpEiEpgUDHNvcLUDChsPrhVOT"
           resources:
             limits:
               cpu: 1000m

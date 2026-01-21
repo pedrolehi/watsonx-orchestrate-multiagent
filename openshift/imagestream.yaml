@@ -1,7 +1,7 @@
 apiVersion: image.openshift.io/v1
 kind: ImageStream
 metadata:
-  name: hml-senac-wxorchestrate-multiagent
+  name: hml-senac-agente-orquestrador
   namespace: hml-senac-orquestrator-chatbotx
 spec:
   lookupPolicy:
@@ -12,6 +12,6 @@ spec:
         kind: DockerImage
         name: us.icr.io/code-engine-senac-dev/senac-wxorchestrate-multiagent:latest
       importPolicy:
-        scheduled: true # Faz polling periódico para verificar mudanças (padrão: 15 minutos)
+        scheduled: true
       referencePolicy:
         type: Local
